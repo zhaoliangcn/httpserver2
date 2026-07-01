@@ -367,7 +367,7 @@ private:
     std::string key_path_;
     std::string cipher_suites_;  // 密码套件配置
     std::unordered_map<std::string, std::pair<std::string, std::string>> basic_auth_users_;  // 用户名 -> {盐, 密码哈希}
-    std::string basic_auth_realm_ = "Restricted Area";  // 基本认证域
+    std::string basic_auth_realm_;  // 基本认证域（为空则不启用）
     bool csrf_protection_enabled_ = false;
     std::string csrf_token_header_ = "X-CSRF-Token";
     std::string csrf_token_param_ = "csrf_token";

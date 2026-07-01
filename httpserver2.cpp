@@ -1276,13 +1276,15 @@ void HttpServer2::handleClientHttp1(tcp::socket socket) {
     bool rate_limited = false;
     std::string client_ip = socket.remote_endpoint().address().to_string();
     
-    // 检查全局限流
-    if (isRateLimited()) {
-        rate_limited = true;
-    } 
-    // 检查IP级别的限流
-    else if (!rate_limiter_.isAllowed(client_ip)) {
-        rate_limited = true;
+    if (requests_per_second_ > 0) {
+        // 检查全局限流
+        if (isRateLimited()) {
+            rate_limited = true;
+        } 
+        // 检查IP级别的限流
+        else if (!rate_limiter_.isAllowed(client_ip)) {
+            rate_limited = true;
+        }
     }
     
     if (rate_limited) {
@@ -2421,13 +2423,15 @@ void HttpServer2::handleClientHttps(ssl::stream<tcp::socket> ssl_socket) {
     std::string client_ip = ssl_socket.lowest_layer().remote_endpoint().address().to_string();
     bool rate_limited = false;
     
-    // 检查全局限流
-    if (isRateLimited()) {
-        rate_limited = true;
-    } 
-    // 检查IP级别的限流
-    else if (!rate_limiter_.isAllowed(client_ip)) {
-        rate_limited = true;
+    if (requests_per_second_ > 0) {
+        // 检查全局限流
+        if (isRateLimited()) {
+            rate_limited = true;
+        } 
+        // 检查IP级别的限流
+        else if (!rate_limiter_.isAllowed(client_ip)) {
+            rate_limited = true;
+        }
     }
     
     if (rate_limited) {
