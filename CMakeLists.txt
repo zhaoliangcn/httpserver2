@@ -126,6 +126,12 @@ set(TEST_REVERSE_PROXY_SRCS
     test_reverse_proxy_simple.cpp
 )
 
+set(TEST_UNIT_SRCS
+    ${LOGGER_IMPL}
+    httpserver2.cpp
+    test_unit.cpp
+)
+
 # ============================================================
 # 可执行文件
 # ============================================================
@@ -191,10 +197,22 @@ target_link_libraries(test_reverse_proxy_simple
         z
 )
 
+# 核心组件单元测试
+add_executable(test_unit ${TEST_UNIT_SRCS})
+target_link_libraries(test_unit
+    PRIVATE
+        Boost::system
+        Boost::thread
+        OpenSSL::SSL
+        OpenSSL::Crypto
+        pthread
+        z
+)
+
 # ============================================================
 # RPATH 设置（Linux / macOS）
 # ============================================================
-set(ALL_TARGETS httpserver2 test_concurrent test_proxy test_static_performance test_reverse_proxy_simple)
+set(ALL_TARGETS httpserver2 test_concurrent test_proxy test_static_performance test_reverse_proxy_simple test_unit)
 
 if(UNIX)
     foreach(target ${ALL_TARGETS})
@@ -263,6 +281,7 @@ add_custom_target(build-tests
     COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR} --target test_proxy
     COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR} --target test_static_performance
     COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR} --target test_reverse_proxy_simple
+    COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR} --target test_unit
     COMMENT "Building all test executables..."
 )
 
