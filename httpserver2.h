@@ -280,6 +280,9 @@ HttpResponse createErrorResponse(HttpErrorType error_type, const std::string& me
 // use_ssl: 是否启用 SSL/TLS（控制 HSTS 等 SSL 相关头）
 void addSecurityHeaders(HttpResponse& response, bool use_ssl);
 
+// gzip 压缩工具函数
+std::string gzipCompress(const std::string& data);
+
 // 请求队列项结构体
 struct RequestQueueItem {
     std::shared_ptr<HttpRequest> request;
