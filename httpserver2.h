@@ -340,6 +340,7 @@ struct Route {
     std::shared_ptr<RouteMatcher> matcher;
     RouteHandler handler;
     std::vector<Middleware> middlewares;
+    std::string host;  // 可选：限制匹配特定 Host 头（虚拟主机）
 };
 
 // HTTP服务器类
@@ -485,10 +486,15 @@ public:
 
     // 路由注册
     void addRoute(const std::string& method, const std::string& pattern, const RouteHandler& handler);
+    // 虚拟主机路由（匹配特定 Host 头）
+    void addRoute(const std::string& method, const std::string& host, const std::string& pattern, const RouteHandler& handler);
     void get(const std::string& pattern, const RouteHandler& handler);
     void post(const std::string& pattern, const RouteHandler& handler);
     void put(const std::string& pattern, const RouteHandler& handler);
     void del(const std::string& pattern, const RouteHandler& handler);
+    // 虚拟主机便捷方法
+    void get(const std::string& host, const std::string& pattern, const RouteHandler& handler);
+    void post(const std::string& host, const std::string& pattern, const RouteHandler& handler);
 
     // 中间件
     void use(const Middleware& middleware);

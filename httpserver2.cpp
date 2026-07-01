@@ -1702,6 +1702,14 @@ void HttpServer2::addRoute(const std::string& method, const std::string& path,
     routes_.push_back({method, matcher, handler, {}});
 }
 
+// 虚拟主机路由注册
+void HttpServer2::addRoute(const std::string& method, const std::string& host,
+                          const std::string& path, const RouteHandler& handler) {
+    std::shared_ptr<RouteMatcher> matcher = createRouteMatcher(path);
+    std::unique_lock<std::shared_mutex> lock(routes_mutex_);
+    routes_.push_back({method, matcher, handler, {}, host});
+}
+
 // 添加中间件
 void HttpServer2::use(const Middleware& middleware) {
     global_middlewares_.push_back(middleware);
@@ -1712,9 +1720,19 @@ void HttpServer2::get(const std::string& path, const RouteHandler& handler) {
     addRoute("GET", path, handler);
 }
 
+// 虚拟主机 GET 路由
+void HttpServer2::get(const std::string& host, const std::string& path, const RouteHandler& handler) {
+    addRoute("GET", host, path, handler);
+}
+
 // 便捷方法：POST路由
 void HttpServer2::post(const std::string& path, const RouteHandler& handler) {
     addRoute("POST", path, handler);
+}
+
+// 虚拟主机 POST 路由
+void HttpServer2::post(const std::string& host, const std::string& path, const RouteHandler& handler) {
+    addRoute("POST", host, path, handler);
 }
 
 // 便捷方法：PUT路由
@@ -1833,7 +1851,14 @@ void HttpServer2::processRequestQueue() {
                     
                     try {
                         // 直接使用item.request中的path_params，避免重复处理
+                        // 设置虚拟主机匹配参数
+                        auto host_it = item.request->headers.find("Host");
+                        if (host_it != item.request->headers.end()) {
+                            item.request->path_params["host"] = host_it->second;
+                        }
                         auto route_handler = findRoute(item.request->method, item.request->path, item.request->path_params);
+                        // 清理 host 参数避免干扰路由匹配
+                        item.request->path_params.erase("host");
                         
                         if (route_handler) {
                             // 使用中间件链处理请求
@@ -2288,6 +2313,15 @@ std::optional<Route> HttpServer2::findRoute(const std::string& method, const std
                 continue;
             }
             
+            // 如果有 Host 限制，检查是否匹配（在请求处理时已从 request headers 提取）
+            // 此处 host_match 由调用者从 request.headers["Host"] 获取并传入 params["host"]
+            if (!route.host.empty()) {
+                auto host_it = params.find("host");
+                if (host_it == params.end() || host_it->second != route.host) {
+                    continue;
+                }
+            }
+            
             // 直接使用params作为参数容器，避免额外的映射创建和复制
             if (route.matcher->match(path, params)) {
                 return route;
@@ -2575,6 +2609,11 @@ void HttpServer2::handleClientHttps(ssl::stream<tcp::socket> ssl_socket) {
                     
                     // 创建路径参数映射
                     std::unordered_map<std::string, std::string> path_params;
+                    // 设置虚拟主机匹配参数
+                    auto host_it = custom_request.headers.find("Host");
+                    if (host_it != custom_request.headers.end()) {
+                        path_params["host"] = host_it->second;
+                    }
                     // 查找匹配的路由处理器
                     auto route_handler = findRoute(custom_request.method, custom_request.path, path_params);
                     // 将找到的路径参数添加到请求中
