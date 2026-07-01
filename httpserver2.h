@@ -56,7 +56,8 @@ enum class LogLevel {
 
 // 访问日志（独立的辅助函数，不走通用日志库）
 void logAccess(const std::string& client_ip, const std::string& method, const std::string& path,
-               const std::string& status_code, const std::string& user_agent, int response_time_ms);
+               const std::string& status_code, const std::string& user_agent, int response_time_ms,
+               const std::string& request_id = "");
 
 // 性能监控类
 class PerformanceMonitor {

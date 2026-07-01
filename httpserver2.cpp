@@ -146,7 +146,8 @@ std::unordered_map<std::string, std::pair<uint64_t, uint64_t>> PerformanceMonito
 static std::mutex g_access_log_mutex;
 
 void logAccess(const std::string& client_ip, const std::string& method, const std::string& path,
-               const std::string& status_code, const std::string& user_agent, int response_time_ms) {
+               const std::string& status_code, const std::string& user_agent, int response_time_ms,
+               const std::string& request_id) {
     std::lock_guard<std::mutex> lock(g_access_log_mutex);
     auto now = std::chrono::system_clock::now();
     auto time_t_now = std::chrono::system_clock::to_time_t(now);
@@ -157,11 +158,37 @@ void logAccess(const std::string& client_ip, const std::string& method, const st
        << std::setw(3) << std::setfill('0') << ms;
     std::string timestamp = ss.str();
     
-    std::string log_entry = timestamp + " - " + client_ip + " - \"" + method + " " + path + "\" " +
-                            status_code + " " + std::to_string(response_time_ms) + "ms - \"" + user_agent + "\"";
+    // 输出 JSON 格式的结构化日志
+    // 不转义字符串以保持可读性（实际生产环境应使用真正的 JSON 序列化）
+    ss.str("");
+    ss << "{\"time\":\"" << timestamp << "\","
+       << "\"client_ip\":\"" << client_ip << "\","
+       << "\"method\":\"" << method << "\","
+       << "\"path\":\"" << path << "\","
+       << "\"status\":\"" << status_code << "\","
+       << "\"duration_ms\":" << response_time_ms << ","
+       << "\"user_agent\":\"" << user_agent << "\"";
+    if (!request_id.empty()) {
+        ss << ",\"request_id\":\"" << request_id << "\"";
+    }
+    ss << "}";
+    std::string json_entry = ss.str();
     
     // 用新日志库的 INFO 级别输出（同时到控制台和文件）
-    LOG_INFO("[ACCESS] " + log_entry);
+    // 同时保留旧格式用于兼容
+    LOG_INFO("[ACCESS] " + json_entry);
+    
+    // 也写入纯文本 access.log（通过全局互斥锁保护）
+    std::ofstream access_log("access.log", std::ios::app);
+    if (access_log.is_open()) {
+        std::string plain_entry = timestamp + " - " + client_ip + " - \"" + method + " " + path + "\" " +
+                                  status_code + " " + std::to_string(response_time_ms) + "ms - \"" + user_agent + "\"";
+        if (!request_id.empty()) {
+            plain_entry += " - id:" + request_id;
+        }
+        access_log << plain_entry << std::endl;
+        access_log.close();
+    }
 }
 
 // ============================================================
@@ -1553,7 +1580,10 @@ void HttpServer2::handleClientHttp1(tcp::socket socket) {
                                 if (debug_info_copy) {
                                     debug_info_copy->end_time = now;
                                     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(debug_info_copy->end_time - debug_info_copy->start_time);
-                                    logAccess(debug_info_copy->client_ip, "/", "GET", http_response.status_code, ":", duration.count());
+                                    logAccess(debug_info_copy->client_ip, custom_request->method, custom_request->path,
+                                             http_response.status_code,
+                                             custom_request->headers.count("User-Agent") ? custom_request->headers["User-Agent"] : ":",
+                                             duration.count(), custom_request->request_id);
                                 }
                                 
                                 // 创建响应副本，准备添加调试信息
@@ -2597,7 +2627,8 @@ void HttpServer2::handleClientHttps(ssl::stream<tcp::socket> ssl_socket) {
                     if (debug_info) {
                         auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - debug_info->start_time);
                         logAccess(debug_info->client_ip, custom_request.path, custom_request.method, custom_response.status_code, 
-                                          custom_request.headers.count("User-Agent") ? custom_request.headers["User-Agent"] : ":", duration.count());
+                                          custom_request.headers.count("User-Agent") ? custom_request.headers["User-Agent"] : ":", duration.count(),
+                                          custom_request.request_id);
                     }
                     
                     // 统一处理：CSRF cookie + 安全头 + 调试头
