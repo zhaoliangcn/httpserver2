@@ -132,6 +132,11 @@ set(TEST_UNIT_SRCS
     test_unit.cpp
 )
 
+set(TEST_STRESS_SRCS
+    ${LOGGER_IMPL}
+    test_stress.cpp
+)
+
 # ============================================================
 # 可执行文件
 # ============================================================
@@ -209,10 +214,22 @@ target_link_libraries(test_unit
         z
 )
 
+# 压力测试
+add_executable(test_stress ${TEST_STRESS_SRCS})
+target_link_libraries(test_stress
+    PRIVATE
+        Boost::system
+        Boost::thread
+        OpenSSL::SSL
+        OpenSSL::Crypto
+        pthread
+        z
+)
+
 # ============================================================
 # RPATH 设置（Linux / macOS）
 # ============================================================
-set(ALL_TARGETS httpserver2 test_concurrent test_proxy test_static_performance test_reverse_proxy_simple test_unit)
+set(ALL_TARGETS httpserver2 test_concurrent test_proxy test_static_performance test_reverse_proxy_simple test_unit test_stress)
 
 if(UNIX)
     foreach(target ${ALL_TARGETS})
@@ -281,7 +298,8 @@ add_custom_target(build-tests
     COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR} --target test_proxy
     COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR} --target test_static_performance
     COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR} --target test_reverse_proxy_simple
-    COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR} --target test_unit
+    COMMAND  --build  --target test_unit
+    COMMAND  --build  --target test_stress
     COMMENT "Building all test executables..."
 )
 
