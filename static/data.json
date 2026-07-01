@@ -1,0 +1,18 @@
+{
+  "name": "静态文件服务测试",
+  "version": "1.0",
+  "features": [
+    "静态文件目录服务",
+    "文件缓存控制",
+    "MIME类型自动识别"
+  ],
+  "test": {
+    "passed": true,
+    "timestamp": "2024-01-01T00:00:00Z",
+    "environment": "development"
+  },
+  "performance": {
+    "cache_ttl": 3600,
+    "mime_types_count": 30
+  }
+}

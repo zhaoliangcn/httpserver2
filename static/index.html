@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>静态资源目录</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            line-height: 1.6;
+            margin: 0;
+            padding: 20px;
+            background-color: #f0f0f0;
+        }
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+            background-color: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        h1 {
+            color: #333;
+            margin-bottom: 20px;
+        }
+        h2 {
+            color: #555;
+            margin-top: 30px;
+            margin-bottom: 15px;
+            padding-bottom: 5px;
+            border-bottom: 1px solid #ddd;
+        }
+        ul {
+            list-style-type: none;
+            padding: 0;
+        }
+        li {
+            margin-bottom: 10px;
+            padding: 8px;
+            background-color: #f9f9f9;
+            border-radius: 4px;
+            transition: background-color 0.3s;
+        }
+        li:hover {
+            background-color: #f0f0f0;
+        }
+        a {
+            color: #0066cc;
+            text-decoration: none;
+            font-weight: 500;
+        }
+        a:hover {
+            text-decoration: underline;
+        }
+        .file-type {
+            color: #666;
+            font-size: 0.9em;
+            margin-left: 10px;
+        }
+        .back-link {
+            margin-top: 30px;
+            padding-top: 20px;
+            border-top: 1px solid #ddd;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>静态资源目录</h1>
+        <p>这是static目录下的文件列表，通过静态文件服务提供。</p>
+        
+        <h2>文件列表</h2>
+        <ul>
+            <li>
+                <a href="index.html">index.html</a>
+                <span class="file-type">HTML文档</span>
+            </li>
+            <li>
+                <a href="test.txt">test.txt</a>
+                <span class="file-type">文本文件</span>
+            </li>
+            <li>
+                <a href="data.json">data.json</a>
+                <span class="file-type">JSON数据</span>
+            </li>
+        </ul>
+        
+        <div class="back-link">
+            <a href="/">返回网站首页</a>
+        </div>
+    </div>
+</body>
+</html>

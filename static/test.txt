@@ -1,0 +1,18 @@
+这是一个静态文件服务测试文本文件。
+
+此文件位于static目录中，通过/static/test.txt路径访问。
+
+测试内容：
+- 静态文件服务
+- MIME类型识别（应识别为text/plain）
+- 缓存控制
+- 二进制文件支持
+Modified at 1765166365.102465
+Modified at 1765166462.977521
+Modified at 1765166562.134571
+Modified at 1765166651.8758788
+Modified at 1765170681.539527
+Modified at 1765175016.8267689
+Modified at 1765175519.033904
+Modified at 1765177170.8346932
+Modified at 1765247585.937543

@@ -1,0 +1,16 @@
+# HttpServer2 配置文件 (YAML格式)
+
+# 基本认证配置
+enable_basic_auth: true
+
+# 请求大小限制配置
+set_request_size_limit: true
+max_request_size: 5242880  # 5MB (字节)
+
+# CSRF保护配置
+enable_csrf_protection: true
+csrf_cookie_name: XSRF-TOKEN
+csrf_header_name: X-CSRF-Token
+
+# 调试模式配置
+enable_debug_mode: true

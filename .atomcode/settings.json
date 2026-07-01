@@ -1,0 +1,31 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "*.{cpp,h}",
+        "command": "make -j$(nproc) 2>&1 | tail -30"
+      },
+      {
+        "matcher": "*.{cpp,h}",
+        "command": "python3 test_*.py 2>&1 | tail -20"
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "*.{o,dylib,so,log}",
+        "block": true,
+        "message": "⚠️ 禁止编辑编译产物和日志文件"
+      }
+    ],
+    "permissions": {
+      "allow": [
+        "Edit",
+        "Write",
+        "Bash(make:*)",
+        "Bash(cmake:*)",
+        "Bash(./httpserver2:*)",
+        "Bash(python3 test_*:*)"
+      ]
+    }
+  }
+}
