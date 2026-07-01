@@ -195,6 +195,7 @@ struct HttpRequest {
     std::unordered_map<std::string, std::string> path_params;  // 路径参数
     std::unordered_map<std::string, std::string> json_body;  // JSON请求体（解析后）
     std::atomic<bool> is_processed{false};  // 用于并发处理控制
+    std::string request_id;     // 唯一请求 ID（用于链路追踪）
     
     // 客户端 socket（流式响应用，如反向代理直接转发）
     // 仅 HTTP 使用；HTTPS 不流式转发
@@ -216,6 +217,7 @@ struct HttpRequest {
         , path_params(std::move(other.path_params))
         , json_body(std::move(other.json_body))
         , is_processed(other.is_processed.load())
+        , request_id(std::move(other.request_id))
         , client_socket(std::move(other.client_socket))
     {}
     
@@ -233,6 +235,7 @@ struct HttpRequest {
             path_params = std::move(other.path_params);
             json_body = std::move(other.json_body);
             is_processed.store(other.is_processed.load());
+            request_id = std::move(other.request_id);
             client_socket = std::move(other.client_socket);
         }
         return *this;

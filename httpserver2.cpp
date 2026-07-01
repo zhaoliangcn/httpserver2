@@ -302,6 +302,11 @@ void HttpServer2::finalizeResponse(HttpResponse& response,
                                     const HttpRequest& request,
                                     bool use_ssl,
                                     const std::shared_ptr<DebugInfo>& debug_info) {
+    // 添加请求 ID 头
+    if (!request.request_id.empty()) {
+        response.headers["X-Request-Id"] = request.request_id;
+    }
+    
     // 添加调试头信息
     if (debug_mode_) {
         std::shared_ptr<DebugInfo> local_debug = debug_info;
@@ -1361,6 +1366,14 @@ void HttpServer2::handleClientHttp1(tcp::socket socket) {
                     const auto& beast_request = state->parser.get();
                     // 将Beast请求转换为自定义请求格式
                     auto custom_request = std::make_shared<HttpRequest>(convertFromBeastRequest(beast_request));
+                    // 生成唯一请求 ID
+                    static std::atomic<uint64_t> req_counter{0};
+                    uint64_t seq = req_counter++;
+                    auto now_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch()).count();
+                    std::stringstream rid_ss;
+                    rid_ss << std::hex << now_us << "-" << std::hex << seq;
+                    custom_request->request_id = rid_ss.str();
                     // 附加客户端 socket（供反向代理流式转发使用）
                     custom_request->client_socket = state->socket;
 
@@ -2521,6 +2534,14 @@ void HttpServer2::handleClientHttps(ssl::stream<tcp::socket> ssl_socket) {
                     
                     // 将Beast请求转换为自定义请求格式
                     HttpRequest custom_request = convertFromBeastRequest(*request);
+                    // 生成唯一请求 ID
+                    static std::atomic<uint64_t> req_counter_ssl{0};
+                    uint64_t seq = req_counter_ssl++;
+                    auto now_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch()).count();
+                    std::stringstream rid_ss;
+                    rid_ss << std::hex << now_us << "-" << std::hex << seq;
+                    custom_request.request_id = rid_ss.str();
                     
                     // 创建路径参数映射
                     std::unordered_map<std::string, std::string> path_params;
