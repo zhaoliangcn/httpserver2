@@ -45,7 +45,8 @@
  *     --help                帮助信息
  */
 
-#include "httpserver2.h"
+// 后端抽象层（支持 Boost.Asio / hp-async-io）
+#include "stress_backend.h"
 #include <iostream>
 #include <iomanip>
 #include <thread>
@@ -291,60 +292,14 @@ static int parseStatusLine(const std::string& header) {
 #endif
 
 // ============================================================
-// Keep-Alive 连接上的单个请求
+// Keep-Alive 连接上的单个请求（使用后端抽象）
 // ============================================================
-struct RequestResult {
-    bool success;       // true if HTTP response was fully received
-    int status_code;    // e.g. 200, 429
-    size_t body_size;
-    bool keep_alive;    // whether server wants to keep connection alive
-};
-
-static RequestResult doRequestOnSocket(tcp::socket& sock, const std::string& request,
-                                       const std::chrono::steady_clock::time_point& deadline)
+static backend::Response doRequestOnSocket(backend::TCPSocket& sock, const std::string& request,
+                                           const std::chrono::steady_clock::time_point& deadline)
 {
-    RequestResult r = {false, 0, 0, false};
-    try {
-        if (std::chrono::steady_clock::now() >= deadline) {
-            return r; // timeout
-        }
-
-        // 发送请求
-        boost::asio::write(sock, boost::asio::buffer(request));
-
-        // 读取完整响应（头 + 体）
-        boost::beast::flat_buffer buf;
-        boost::beast::http::response<boost::beast::http::string_body> response;
-        boost::beast::http::read(sock, buf, response);
-
-        r.success = true;
-        r.status_code = response.result_int();
-        r.body_size = response.body().size();
-        r.keep_alive = response.keep_alive();
-        return r;
-    } catch (const boost::system::system_error&) {
-        return r; // connection error
-    } catch (const std::exception&) {
-        return r; // other error
-    } catch (...) {
-        return r;
-    }
-}
-
-// ============================================================
-// 新 TCP 连接
-// ============================================================
-static bool connectSocket(net::io_context& ioc, tcp::socket& sock,
-                          const StressConfig& cfg)
-{
-    try {
-        tcp::resolver resolver(ioc);
-        auto endpoints = resolver.resolve(cfg.host, std::to_string(cfg.port));
-        boost::asio::connect(sock, endpoints);
-        return true;
-    } catch (...) {
-        return false;
-    }
+    if (std::chrono::steady_clock::now() >= deadline) return {};
+    if (!backend::send(sock, request)) return {};
+    return backend::recv_http(sock);
 }
 
 // ============================================================
@@ -355,8 +310,8 @@ static void worker(const StressConfig& cfg, StressStats& stats,
                    std::atomic<int>& remaining_time_ms,
                    int /* thread_id */)
 {
-    net::io_context ioc;
-    tcp::socket sock(ioc);
+    backend::Context ctx;
+    backend::TCPSocket sock(ctx);
     bool has_conn = false;
     int reuse_count = 0;
 
@@ -382,13 +337,12 @@ static void worker(const StressConfig& cfg, StressStats& stats,
         }
 
         if (need_new_conn) {
-            boost::system::error_code ec;
-            sock.close(ec);
-            bool connected = connectSocket(ioc, sock, cfg);
+            backend::close(sock);
+            bool connected = backend::connect(sock, cfg.host, cfg.port, cfg.timeout_sec);
             // 重试最多 3 次
             for (int retry = 0; !connected && retry < 3 && !g_should_exit; ++retry) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(10));
-                connected = connectSocket(ioc, sock, cfg);
+                connected = backend::connect(sock, cfg.host, cfg.port, cfg.timeout_sec);
             }
             if (!connected) {
                 stats.sent++;
@@ -409,7 +363,7 @@ static void worker(const StressConfig& cfg, StressStats& stats,
         auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(cfg.timeout_sec);
         auto start = std::chrono::steady_clock::now();
 
-        RequestResult rr = doRequestOnSocket(sock, req, deadline);
+        backend::Response rr = doRequestOnSocket(sock, req, deadline);
 
         auto end = std::chrono::steady_clock::now();
         double elapsed_ms = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() / 1000.0;
@@ -419,10 +373,8 @@ static void worker(const StressConfig& cfg, StressStats& stats,
             stats.ok++;
             stats.bytes += rr.body_size;
             stats.addLatency(elapsed_ms, rr.status_code);
-            // 检查连接是否仍有效（Keep-Alive 检测）
             if (!rr.keep_alive) {
-                boost::system::error_code ec;
-                sock.close(ec);
+                backend::close(sock);
                 has_conn = false;
                 reuse_count = 0;
             } else {
@@ -431,10 +383,8 @@ static void worker(const StressConfig& cfg, StressStats& stats,
         } else if (rr.success) {
             stats.failed++;
             stats.addLatency(elapsed_ms, rr.status_code);
-            // 非 2xx：若服务端要求关闭连接则标记失效
             if (!rr.keep_alive) {
-                boost::system::error_code ec;
-                sock.close(ec);
+                backend::close(sock);
                 has_conn = false;
                 reuse_count = 0;
             } else {
@@ -443,17 +393,13 @@ static void worker(const StressConfig& cfg, StressStats& stats,
         } else {
             stats.failed++;
             stats.conn_errors++;
-            // 连接失效
-            boost::system::error_code ec;
-            sock.close(ec);
+            backend::close(sock);
             has_conn = false;
             reuse_count = 0;
         }
     }
 
-    // 关闭连接
-    boost::system::error_code ec;
-    sock.close(ec);
+    backend::close(sock);
 }
 
 // ============================================================

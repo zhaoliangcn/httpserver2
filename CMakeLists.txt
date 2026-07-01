@@ -214,17 +214,63 @@ target_link_libraries(test_unit
         z
 )
 
-# 压力测试
-add_executable(test_stress ${TEST_STRESS_SRCS})
-target_link_libraries(test_stress
-    PRIVATE
-        Boost::system
-        Boost::thread
-        OpenSSL::SSL
-        OpenSSL::Crypto
-        pthread
-        z
+# ============================================================
+# 双后端选项（压力测试）
+# ============================================================
+option(USE_HP_ASYNC_IO "Use hp-async-io backend for test_stress" OFF)
+
+# 压力测试 (Boost.Asio 后端)
+set(TEST_STRESS_BOOST_SRCS
+    ${LOGGER_IMPL}
+    test_stress.cpp
 )
+
+# 压力测试 (hp-async-io 后端)
+set(TEST_STRESS_HP_ASYNC_SRCS
+    test_stress.cpp
+)
+
+# 主压力测试目标
+if(USE_HP_ASYNC_IO)
+    # hp-async-io 后端（需 clang++ / C++20，无 Boost 依赖）
+    set(HP_ASYNC_IO_DIR "${CMAKE_SOURCE_DIR}/../hp-async-io")
+    set(HP_ASYNC_IO_INCLUDE_DIR "${HP_ASYNC_IO_DIR}/include")
+    set(HP_ASYNC_IO_LIBRARY "${HP_ASYNC_IO_DIR}/build/libhp_async_io.a")
+    if(NOT EXISTS "${HP_ASYNC_IO_LIBRARY}")
+        message(FATAL_ERROR "hp-async-io library not found at ${HP_ASYNC_IO_LIBRARY}")
+    endif()
+    include_directories(${HP_ASYNC_IO_INCLUDE_DIR})
+
+    # hp-async-io 需要 C++20 和 coroutines 支持（推荐 clang++）
+    find_program(CLANGXX clang++)
+    if(CLANGXX)
+        set(CMAKE_CXX_COMPILER "${CLANGXX}")
+        message(STATUS "hp-async-io: using clang++ at ${CLANGXX}")
+    else()
+        message(WARNING "clang++ not found, hp-async-io may not compile with GCC <10")
+    endif()
+
+    add_executable(test_stress ${TEST_STRESS_HP_ASYNC_SRCS})
+    target_compile_definitions(test_stress PRIVATE USE_HP_ASYNC_IO)
+    target_compile_options(test_stress PRIVATE -std=c++20 -fcoroutines-ts)
+    target_link_libraries(test_stress
+        PRIVATE
+            ${HP_ASYNC_IO_LIBRARY}
+            pthread
+    )
+else()
+    # Boost.Asio 后端（当前默认）
+    add_executable(test_stress ${TEST_STRESS_BOOST_SRCS})
+    target_link_libraries(test_stress
+        PRIVATE
+            Boost::system
+            Boost::thread
+            OpenSSL::SSL
+            OpenSSL::Crypto
+            pthread
+            z
+    )
+endif()
 
 # ============================================================
 # RPATH 设置（Linux / macOS）
