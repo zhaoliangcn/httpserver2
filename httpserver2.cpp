@@ -313,8 +313,7 @@ void addSecurityHeaders(HttpResponse& response, bool use_ssl) {
     response.headers["Permissions-Policy"] =
         "camera=(), "
         "microphone=(), "
-        "geolocation=(), "
-        "interest-cohort=()";
+        "geolocation=()";
 
     // Cross-Origin-Opener-Policy: 隔离跨窗口访问（防止 Spectre 信息泄露）
     response.headers["Cross-Origin-Opener-Policy"] = "same-origin";
@@ -592,14 +591,12 @@ void HttpServer2::sendFileResponse(tcp::socket& socket,
     // Content-Length (file_body 不自动设置)
     response->content_length(file_size);
     
-    // 异步发送（底层使用 sendfile 系统调用）
-    http::async_write(socket, *response,
-        [response](beast::error_code ec, std::size_t) {
-            if (ec) {
-                LOG_ERROR("sendFileResponse write error: " + ec.message());
-            }
-        }
-    );
+    // 同步发送（确保完整文件发送完成后再返回）
+    beast::error_code write_ec;
+    http::write(socket, *response, write_ec);
+    if (write_ec) {
+        LOG_ERROR("sendFileResponse write error: " + write_ec.message());
+    }
 }
 
 void HttpServer2::sendFileResponse(std::shared_ptr<ssl::stream<tcp::socket>> ssl_socket_ptr,
@@ -644,17 +641,19 @@ void HttpServer2::sendFileResponse(std::shared_ptr<ssl::stream<tcp::socket>> ssl
     
     response->content_length(file_size);
     
-    http::async_write(*ssl_socket_ptr, *response,
-        [ssl_socket_ptr, response](beast::error_code ec, std::size_t) {
-            boost::ignore_unused(ec, response);
-            boost::system::error_code shut_ec;
-            ssl_socket_ptr->shutdown(shut_ec);
-            if (ssl_socket_ptr->lowest_layer().is_open()) {
-                boost::system::error_code close_ec;
-                ssl_socket_ptr->lowest_layer().close(close_ec);
-            }
-        }
-    );
+    // 同步发送（确保完整文件发送完成后再返回）
+    beast::error_code write_ec;
+    http::write(*ssl_socket_ptr, *response, write_ec);
+    if (write_ec) {
+        LOG_ERROR("sendFileResponse(SSL) write error: " + write_ec.message());
+    }
+    // 关闭 SSL 连接
+    boost::system::error_code shut_ec;
+    ssl_socket_ptr->shutdown(shut_ec);
+    if (ssl_socket_ptr->lowest_layer().is_open()) {
+        boost::system::error_code close_ec;
+        ssl_socket_ptr->lowest_layer().close(close_ec);
+    }
 }
 
 // PerformanceMonitor类方法实现
