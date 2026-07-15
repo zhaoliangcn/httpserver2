@@ -17,6 +17,16 @@ Makefile.in
 
 # 日志
 *.log
+*.log.*
+access.log
+error.log
+
+# SSL 证书和密钥（绝对不应提交到版本控制）
+server.key
+server.crt
+*.pem
+*.p12
+*.pfx
 
 # 性能数据
 performance_*.json
