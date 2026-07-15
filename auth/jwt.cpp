@@ -231,6 +231,12 @@ JwtClaims Jwt::jsonToClaims(const std::string& json) {
 // Token 签发
 // ============================================================
 std::string Jwt::sign(const JwtClaims& claims, const JwtConfig& config) {
+    // 安全检查：HS256 模式下 secret 不能为空
+    if (config.algorithm == "HS256" && config.secret.empty()) {
+        LOG_ERROR("JWT sign failed: HS256 secret is empty — set JWT_SECRET environment variable");
+        return "";
+    }
+    
     // Header
     std::string header = "{\"alg\":\"" + config.algorithm + "\",\"typ\":\"JWT\"}";
     std::string header_b64 = base64UrlEncode(header);

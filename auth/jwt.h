@@ -13,12 +13,12 @@ namespace http2 { namespace auth {
 
 // JWT 配置
 struct JwtConfig {
-    std::string secret = "change-me";           // HS256 密钥
-    std::string public_key = "";                // RS256 公钥
-    std::string private_key = "";               // RS256 私钥
+    std::string secret;                             // HS256 密钥（必须从环境变量 JWT_SECRET 设置）
+    std::string public_key = "";                    // RS256 公钥
+    std::string private_key = "";                   // RS256 私钥
     std::string issuer = "httpserver2";
     std::chrono::seconds ttl = std::chrono::hours(2);
-    std::string algorithm = "HS256";            // HS256 | RS256
+    std::string algorithm = "HS256";                // HS256 | RS256
     std::string audience = "";
 };
 

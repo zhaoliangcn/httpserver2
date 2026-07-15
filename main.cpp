@@ -203,8 +203,16 @@ int main(int argc, char* argv[]) {
         // 根据配置文件设置基本认证
         if (config.enable_basic_auth) {
             server.setBasicAuth("Test Server");
-            server.addUser("admin", "password");
-            std::cout << "已设置基本认证用户：admin/password" << std::endl;
+            // 从环境变量读取用户名和密码，避免硬编码
+            const char* env_user = std::getenv("HTTP_AUTH_USERNAME");
+            const char* env_pass = std::getenv("HTTP_AUTH_PASSWORD");
+            if (env_user && env_pass && strlen(env_user) > 0 && strlen(env_pass) > 0) {
+                server.addUser(env_user, env_pass);
+                std::cout << "已设置基本认证用户（来自环境变量）" << std::endl;
+            } else {
+                std::cout << "警告：未设置 HTTP_AUTH_USERNAME/HTTP_AUTH_PASSWORD 环境变量，基本认证已跳过" << std::endl;
+                std::cout << "提示：可设置环境变量并重新启动，或使用配置文件启用认证" << std::endl;
+            }
         } else {
             std::cout << "基本认证已禁用" << std::endl;
         }

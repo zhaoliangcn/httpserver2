@@ -92,6 +92,16 @@
 - 请求大小限制
 - 连接池管理
 
+### 安全配置（环境变量）
+
+| 环境变量 | 用途 | 说明 |
+|----------|------|------|
+| `HTTP_AUTH_USERNAME` | 基本认证用户名 | 与 `HTTP_AUTH_PASSWORD` 同时设置才启用 |
+| `HTTP_AUTH_PASSWORD` | 基本认证密码 | 建议使用强密码 |
+| `JWT_SECRET` | JWT HS256 签名密钥 | 未设置时 `sign()` 会拒绝签发 Token |
+
+> 所有凭据**必须**通过环境变量注入，禁止在代码或配置文件中硬编码。
+
 ---
 
 ## 快速开始
@@ -113,14 +123,19 @@ make -j$(nproc)
 ### 运行
 
 ```bash
+# 设置安全配置（建议通过环境变量，避免硬编码凭据）
+export HTTP_AUTH_USERNAME=admin
+export HTTP_AUTH_PASSWORD=your_secure_password
+export JWT_SECRET=your_strong_random_secret_here
+
 # 默认 HTTP 模式（端口 8080）
 ./httpserver2
 
-# HTTPS 模式
-./httpserver2 --ssl --cert server.crt --key server.key
+# HTTPS 模式（需要 server.crt 和 server.key）
+./httpserver2 --ssl
 
 # 指定端口和线程数
-./httpserver2 --port 3000 --threads 8
+./httpserver2 3000 --threads 8
 ```
 
 ### 最小示例
@@ -161,9 +176,9 @@ int main() {
 ```cpp
 #include "auth/jwt.h"
 
-// 配置
+// 配置 — 密钥从环境变量读取，避免硬编码
 http2::auth::JwtConfig config;
-config.secret = "your-secret-key";
+config.secret = std::getenv("JWT_SECRET") ? std::getenv("JWT_SECRET") : "";
 config.issuer = "myapp";
 
 // 登录接口 — 签发 Token
@@ -182,6 +197,8 @@ server.post("/api/auth/login", [](const HttpRequest& req) -> HttpResponse {
 // 需要认证的路由
 server.use(http2::auth::jwtAuthMiddleware(config));
 ```
+
+> **安全提示**：JWT 密钥必须通过 `JWT_SECRET` 环境变量设置，HS256 模式下密钥为空时 `sign()` 会返回空字符串并记录错误日志。
 
 ### 数据库操作
 
