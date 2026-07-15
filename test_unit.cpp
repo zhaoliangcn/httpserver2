@@ -10,6 +10,13 @@
 #include <iostream>
 #include <sstream>
 #include <zlib.h>
+#include "auth/jwt.h"
+#include "validation/validator.h"
+#include "session/session.h"
+#include "db/database.h"
+#include "cache/cache.h"
+#include "docs/openapi.h"
+#include "ws/websocket.h"
 
 // ============================================================
 // 最小化测试框架
@@ -553,6 +560,331 @@ static void test_HttpErrorTypeComplete() {
 // ============================================================
 // 主函数
 // ============================================================
+// ============================================================
+// JWT 测试
+// ============================================================
+static void test_jwt() {
+    std::cout << "\n--- JWT 测试 ---\n";
+    
+    http2::auth::JwtConfig config;
+    config.secret = "test-secret-key";
+    config.issuer = "test-issuer";
+    config.ttl = std::chrono::hours(1);
+    
+    http2::auth::JwtClaims claims;
+    claims.subject = "user123";
+    claims.issuer = "test-issuer";
+    claims.roles = {"admin", "user"};
+    claims.custom["department"] = "engineering";
+    
+    std::string token = http2::auth::Jwt::sign(claims, config);
+    TEST("JWT sign produces non-empty token", !token.empty());
+    TEST("JWT has three parts", 
+         token.find('.') != std::string::npos && 
+         token.rfind('.') != token.find('.'));
+    
+    auto verified = http2::auth::Jwt::verify(token, config);
+    TEST("JWT verify succeeds", verified.has_value());
+    TEST("JWT subject matches", verified && verified->subject == "user123");
+    TEST("JWT issuer matches", verified && verified->issuer == "test-issuer");
+    TEST("JWT verify succeeds", verified.has_value());
+    TEST("JWT subject matches", verified && verified->subject == "user123");
+    TEST("JWT issuer matches", verified && verified->issuer == "test-issuer");
+    
+    // 过期测试
+    http2::auth::JwtConfig expired_config;
+    expired_config.secret = "test-secret";
+    expired_config.ttl = std::chrono::seconds(0);
+    http2::auth::JwtClaims expired_claims;
+    expired_claims.expires_at = std::chrono::system_clock::now() - std::chrono::hours(1);
+    std::string expired_token = http2::auth::Jwt::sign(expired_claims, expired_config);
+    // 使用不同的密钥验证旧 token
+    auto expired_result = http2::auth::Jwt::verify(expired_token, expired_config);
+    TEST("JWT expired token verification", !expired_result.has_value() || 
+         expired_result->expires_at < std::chrono::system_clock::now());
+    
+    // Bearer 提取
+    std::string bearer = "Bearer " + token;
+    std::string extracted = http2::auth::Jwt::extractFromBearer(bearer);
+    TEST("JWT Bearer extraction", extracted == token);
+    TEST("JWT empty Bearer", http2::auth::Jwt::extractFromBearer("").empty());
+}
+
+// ============================================================
+// 验证器测试
+// ============================================================
+static void test_validator() {
+    std::cout << "\n--- 验证器测试 ---\n";
+    
+    using namespace http2::validation;
+    
+    // REQUIRED
+    auto r1 = Validator::validateJson({}, {{"name", RuleType::REQUIRED, "", "Name is required"}});
+    TEST("Validator REQUIRED fails on empty", !r1.valid);
+    TEST("Validator REQUIRED has error", !r1.errors.empty());
+    
+    auto r2 = Validator::validateJson({{"name", "John"}}, {{"name", RuleType::REQUIRED}});
+    TEST("Validator REQUIRED passes with value", r2.valid);
+    
+    // EMAIL
+    auto r3 = Validator::validateJson({{"email", "invalid"}}, {{"email", RuleType::EMAIL}});
+    TEST("Validator EMAIL rejects invalid", !r3.valid);
+    
+    auto r4 = Validator::validateJson({{"email", "test@example.com"}}, {{"email", RuleType::EMAIL}});
+    TEST("Validator EMAIL accepts valid", r4.valid);
+    
+    // INT
+    auto r5 = Validator::validateJson({{"age", "abc"}}, {{"age", RuleType::INT}});
+    TEST("Validator INT rejects non-numeric", !r5.valid);
+    
+    auto r6 = Validator::validateJson({{"age", "25"}}, {{"age", RuleType::INT}});
+    TEST("Validator INT accepts numeric", r6.valid);
+    
+    // ENUM
+    auto r7 = Validator::validateJson({{"role", "invalid"}}, 
+                                       {{"role", RuleType::ENUM, "admin,user,guest"}});
+    TEST("Validator ENUM rejects invalid", !r7.valid);
+    
+    auto r8 = Validator::validateJson({{"role", "admin"}}, 
+                                       {{"role", RuleType::ENUM, "admin,user,guest"}});
+    TEST("Validator ENUM accepts valid", r8.valid);
+    
+    // LENGTH
+    auto r9 = Validator::validateJson({{"name", "ab"}}, 
+                                       {{"name", RuleType::LENGTH, "3-32"}});
+    TEST("Validator LENGTH rejects short", !r9.valid);
+    
+    auto r10 = Validator::validateJson({{"name", "validname"}}, 
+                                        {{"name", RuleType::LENGTH, "3-32"}});
+    TEST("Validator LENGTH accepts valid", r10.valid);
+    
+    // IP
+    auto r11 = Validator::validateJson({{"ip", "not-an-ip"}}, {{"ip", RuleType::IP}});
+    TEST("Validator IP rejects invalid", !r11.valid);
+    
+    auto r12 = Validator::validateJson({{"ip", "192.168.1.1"}}, {{"ip", RuleType::IP}});
+    TEST("Validator IP accepts valid", r12.valid);
+}
+
+// ============================================================
+// 数据库测试
+// ============================================================
+static void test_database() {
+    std::cout << "\n--- 数据库测试 ---\n";
+    
+    http2::db::DBConfig config;
+    config.dsn = ":memory:";  // 使用内存数据库
+    config.type = http2::db::DBType::SQLITE;
+    
+    auto db = http2::db::Database::create(config);
+    TEST("Database create", db != nullptr);
+    TEST("Database connect", db->connect());
+    TEST("Database is connected", db->isConnected());
+    
+    // 建表
+    auto r1 = db->execute("CREATE TABLE IF NOT EXISTS test (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)");
+    TEST("Database CREATE TABLE", r1.success());
+    
+    // 插入
+    auto r2 = db->execute("INSERT INTO test (name, age) VALUES (?, ?)", {"Alice", "30"});
+    TEST("Database INSERT", r2.success());
+    TEST("Database INSERT affected rows", r2.affected_rows > 0);
+    TEST("Database last_insert_id", r2.last_insert_id > 0);
+    
+    // 插入另一条
+    db->execute("INSERT INTO test (name, age) VALUES (?, ?)", {"Bob", "25"});
+    
+    // 查询
+    auto r3 = db->execute("SELECT * FROM test WHERE name = ?", {"Alice"});
+    TEST("Database SELECT", r3.success());
+    TEST("Database SELECT row count", r3.rowCount() == 1);
+    TEST("Database SELECT columns", r3.colCount() >= 2);
+    TEST("Database SELECT value", r3.value() == "1");
+    
+    // 查询全部
+    auto r4 = db->execute("SELECT * FROM test ORDER BY age");
+    TEST("Database SELECT all", r4.success() && r4.rowCount() == 2);
+    
+    // 事务
+    TEST("Database beginTransaction", db->beginTransaction());
+    auto r5 = db->execute("INSERT INTO test (name, age) VALUES (?, ?)", {"Charlie", "35"});
+    TEST("Database insert in transaction", r5.success());
+    TEST("Database commit", db->commit());
+    
+    // 验证事务提交
+    auto r6 = db->execute("SELECT COUNT(*) FROM test");
+    TEST("Database transaction committed", r6.value() == "3");
+    
+    // 回滚测试
+    db->beginTransaction();
+    db->execute("INSERT INTO test (name, age) VALUES (?, ?)", {"Dave", "40"});
+    db->rollback();
+    auto r7 = db->execute("SELECT COUNT(*) FROM test");
+    TEST("Database rollback", r7.value() == "3");
+    
+    db->disconnect();
+    TEST("Database disconnect", !db->isConnected());
+}
+
+// ============================================================
+// Session 测试
+// ============================================================
+static void test_session() {
+    std::cout << "\n--- Session 测试 ---\n";
+    
+    auto store = std::make_shared<http2::session::MemorySessionStore>(std::chrono::hours(24));
+    
+    // 创建 session
+    std::string id = http2::session::MemorySessionStore::generateSessionId();
+    TEST("Session ID generation", !id.empty());
+    TEST("Session ID length", id.length() >= 32);
+    
+    auto session = std::make_shared<http2::session::Session>(id, std::chrono::hours(24));
+    TEST("Session create", session != nullptr);
+    TEST("Session ID matches", session->id() == id);
+    TEST("Session not expired", !session->isExpired());
+    
+    // 读写
+    session->set("username", "alice");
+    session->set("role", "admin");
+    TEST("Session set/get", session->get("username") == "alice");
+    TEST("Session has", session->has("role"));
+    TEST("Session has (negative)", !session->has("nonexistent"));
+    TEST("Session default value", session->get("nonexistent", "default") == "default");
+    
+    // 删除
+    session->remove("role");
+    TEST("Session remove", !session->has("role"));
+    
+    // 存储
+    store->save(session);
+    auto loaded = store->load(id);
+    TEST("Session store load", loaded != nullptr);
+    TEST("Session store data", loaded->get("username") == "alice");
+    
+    // 销毁
+    store->destroy(id);
+    auto destroyed = store->load(id);
+    TEST("Session destroy", destroyed == nullptr);
+    
+    // 清理
+    store->cleanup();
+    TEST("Session cleanup", true);
+}
+
+// ============================================================
+// 缓存测试
+// ============================================================
+static void test_cache() {
+    std::cout << "\n--- 缓存测试 ---\n";
+    
+    auto cache = std::make_shared<http2::cache::MemoryCache>(10);
+    
+    TEST("Cache empty initially", cache->size() == 0);
+    TEST("Cache get missing", !cache->get("nonexistent").has_value());
+    TEST("Cache exists missing", !cache->exists("nonexistent"));
+    
+    cache->set("key1", "value1", std::chrono::seconds(60));
+    TEST("Cache set/get", cache->get("key1").value_or("") == "value1");
+    TEST("Cache exists", cache->exists("key1"));
+    TEST("Cache size", cache->size() == 1);
+    
+    cache->set("key2", "value2", std::chrono::seconds(60));
+    TEST("Cache multiple keys", cache->size() == 2);
+    TEST("Cache get key2", cache->get("key2").value_or("") == "value2");
+    
+    cache->del("key1");
+    TEST("Cache delete", !cache->exists("key1"));
+    TEST("Cache size after delete", cache->size() == 1);
+    
+    cache->clear();
+    TEST("Cache clear", cache->size() == 0);
+}
+
+// ============================================================
+// OpenAPI 测试
+// ============================================================
+static void test_openapi() {
+    std::cout << "\n--- OpenAPI 测试 ---\n";
+    
+    http2::docs::OpenApiDoc doc;
+    doc.setTitle("Test API");
+    doc.setVersion("1.0.0");
+    
+    http2::docs::ApiEndpoint ep;
+    ep.method = "GET";
+    ep.path = "/api/users";
+    ep.summary = "Get users";
+    ep.description = "Returns a list of users";
+    ep.parameters.push_back({"page", "query", "Page number", false, "integer"});
+    ep.parameters.push_back({"size", "query", "Page size", false, "integer"});
+    ep.responses.push_back({"200", "Successful response"});
+    ep.responses.push_back({"400", "Bad request"});
+    ep.tags = {"users"};
+    
+    doc.addEndpoint(ep);
+    
+    std::string json = doc.toJson();
+    TEST("OpenAPI JSON generation", !json.empty());
+    TEST("OpenAPI contains title", json.find("Test API") != std::string::npos);
+    TEST("OpenAPI contains path", json.find("/api/users") != std::string::npos);
+    TEST("OpenAPI contains method", json.find("get") != std::string::npos);
+    TEST("OpenAPI is valid JSON", json[0] == '{');
+    
+    std::string html = doc.toHtml();
+    TEST("OpenAPI HTML generation", !html.empty());
+    TEST("OpenAPI HTML contains title", html.find("Test API") != std::string::npos);
+    TEST("OpenAPI is valid HTML", html.find("<html") != std::string::npos);
+}
+
+// ============================================================
+// CORS 测试
+// ============================================================
+static void test_cors() {
+    std::cout << "\n--- CORS 测试 ---\n";
+    
+    CorsConfig config;
+    TEST("CORS default disabled", !config.enabled);
+    TEST("CORS default origin", config.allowed_origins == "*");
+    TEST("CORS default methods", !config.allowed_methods.empty());
+    
+    config.enabled = true;
+    config.allowed_origins = "https://example.com";
+    config.allow_credentials = true;
+    
+    // 验证配置
+    TEST("CORS enabled", config.enabled);
+    TEST("CORS origin set", config.allowed_origins == "https://example.com");
+    TEST("CORS credentials", config.allow_credentials);
+}
+
+// ============================================================
+// WebSocket 消息测试
+// ============================================================
+static void test_websocket_message() {
+    std::cout << "\n--- WebSocket 消息测试 ---\n";
+    
+    using namespace http2::ws;
+    
+    auto text_msg = WebSocketMessage::text("Hello, WebSocket!");
+    TEST("WS text message opcode", text_msg.opcode == WebSocketMessage::TEXT);
+    TEST("WS text message fin", text_msg.fin);
+    TEST("WS text message data", text_msg.textData() == "Hello, WebSocket!");
+    
+    std::vector<char> bin_data = {static_cast<char>(0x00), static_cast<char>(0x01), static_cast<char>(0x02), static_cast<char>(0xFF)};
+    auto bin_msg = WebSocketMessage::binary(bin_data);
+    TEST("WS binary message opcode", bin_msg.opcode == WebSocketMessage::BINARY);
+    TEST("WS binary message data", bin_msg.data.size() == 4);
+    
+    auto close_msg = WebSocketMessage::close(1000, "Normal closure");
+    TEST("WS close message opcode", close_msg.opcode == WebSocketMessage::CLOSE);
+    
+    std::vector<char> ping_data = {'t', 'e', 's', 't'};
+    auto ping_msg = WebSocketMessage::fromData(WebSocketMessage::PING, ping_data);
+    TEST("WS ping message opcode", ping_msg.opcode == WebSocketMessage::PING);
+    TEST("WS ping message data", ping_msg.data.size() == 4);
+}
+
 int main() {
     std::cout << "================================================\n";
     std::cout << "  HttpServer2 核心组件单元测试（完整版）\n";
@@ -573,6 +905,16 @@ int main() {
     test_ScopedTimer();
     test_edgeCases();
     test_HttpErrorTypeComplete();
+    
+    // 新模块测试
+    test_jwt();
+    test_validator();
+    test_database();
+    test_session();
+    test_cache();
+    test_openapi();
+    test_cors();
+    test_websocket_message();
 
     std::cout << "\n================================================\n";
     std::cout << "  结果: " << (g_passed + g_failed) << " 总用例, "

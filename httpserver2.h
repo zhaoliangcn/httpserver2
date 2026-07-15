@@ -29,6 +29,14 @@
 // 引入单头文件日志库
 #include "single_include/logger.h"
 
+// WebSocket 前向声明
+namespace http2 { namespace ws {
+    struct WebSocketHandler;
+    class WebSocketSession;
+    class WebSocketManager;
+    extern WebSocketManager g_ws_manager;
+}}
+
 // 日志级别枚举（与外部 logger 库对接）
 enum class LogLevel {
     DEBUG = 1,
@@ -346,6 +354,17 @@ struct Route {
     std::string host;  // 可选：限制匹配特定 Host 头（虚拟主机）
 };
 
+// CORS 配置结构
+struct CorsConfig {
+    bool enabled = false;
+    std::string allowed_origins = "*";
+    std::string allowed_methods = "GET, POST, PUT, DELETE, OPTIONS, PATCH";
+    std::string allowed_headers = "Content-Type, Authorization, X-Requested-With, X-CSRF-Token";
+    bool allow_credentials = false;
+    int max_age_seconds = 86400;
+    std::vector<std::string> exposed_headers;
+};
+
 // HTTP服务器类
 class HttpServer2 {
 private:
@@ -425,10 +444,20 @@ private:
     std::thread config_watch_thread_;  // 配置文件监控线程
     std::chrono::milliseconds config_check_interval_ = std::chrono::milliseconds(30000);  // 配置检查间隔（30秒）
     
+    // CORS 配置
+    CorsConfig cors_config_;
+    
+    // 原生 WebSocket 处理器注册表（使用 shared_ptr 避免不完整类型问题）
+    std::unordered_map<std::string, std::shared_ptr<http2::ws::WebSocketHandler>> ws_handlers_;
+    
     // 请求队列
     std::queue<RequestQueueItem> request_queue_;
     std::mutex queue_mutex_;
     std::condition_variable queue_cv_;
+    
+    // 活跃连接计数（用于 graceful shutdown）
+    std::atomic<size_t> active_connections_{0};
+    std::atomic<bool> shutdown_in_progress_{false};
     
     // 线程管理
     std::thread cleanup_thread_;  // 清理线程
@@ -444,6 +473,10 @@ private:
     void acceptConnection();
     void handleClientHttp1(tcp::socket socket);
     void handleClientHttps(ssl::stream<tcp::socket> socket);
+    
+    // 统一的请求处理模板（消除 HTTP/HTTPS 重复代码）
+    template <typename StreamType>
+    void handleClient(StreamType stream, bool use_ssl);
 
     // 请求处理函数
     std::optional<Route> findRoute(const std::string& method, const std::string& path, std::unordered_map<std::string, std::string>& params);
@@ -535,6 +568,11 @@ public:
     void setMaxRequestSize(size_t max_size_bytes);
     void checkRequestSize(const HttpRequest& request);
 
+    // CORS 支持
+    void enableCors(const CorsConfig& config);
+    void setCorsOrigin(const std::string& origin);
+    void setCorsCredentials(bool allow);
+
     // 静态文件服务
     HttpResponse serveStaticFile(const HttpRequest& request, const std::string& url_path, const std::string& directory_path, const std::string& default_file);
     void serveStatic(const std::string& url_path, const std::string& directory_path);
@@ -556,6 +594,9 @@ public:
 
     // WebSocket 代理：将 WebSocket 连接双向转发到目标服务器
     void addWebSocketProxy(const std::string& path, const std::string& target_url);
+    
+    // 原生 WebSocket 端点注册
+    void addWebSocket(const std::string& path, const http2::ws::WebSocketHandler& handler);
 
     // 调试和监控
     void enableDebugMode(bool enable);
@@ -608,7 +649,8 @@ private:
                                      const std::string& client_ip,
                                      const std::string& path,
                                      bool keep_alive,
-                                     bool should_compress);
+                                     bool should_compress,
+                                     std::function<void()> on_complete = nullptr);
     
     // sendfile 零拷贝文件发送（当 HttpResponse::file_body_path 非空时使用）
     static void sendFileResponse(tcp::socket& socket,

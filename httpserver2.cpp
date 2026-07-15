@@ -28,6 +28,7 @@
 #include <fstream>
 #include <filesystem>
 #include <sys/stat.h>
+#include "ws/websocket.h"
 
 // PerformanceMonitor类静态成员初始化
 std::atomic<uint64_t> PerformanceMonitor::total_requests_(0);
@@ -273,6 +274,10 @@ Middleware createErrorHandlingMiddleware() {
 // ============================================================
 // 安全头添加函数
 // ============================================================
+// CORS 头辅助函数（前向声明，实现在后面）
+static void addCorsHeaders(HttpResponse& response, const CorsConfig& config, const std::string& request_origin = "");
+
+// ============================================================
 void addSecurityHeaders(HttpResponse& response, bool use_ssl) {
     // Content-Security-Policy: 限制资源加载来源
     // 注意: 如需内联脚本/样式，应在具体路由中覆盖此头或使用 nonce
@@ -376,6 +381,16 @@ void HttpServer2::finalizeResponse(HttpResponse& response,
 
     // 添加安全头
     addSecurityHeaders(response, use_ssl);
+    
+    // 添加 CORS 头（如果启用）
+    if (cors_config_.enabled) {
+        std::string origin;
+        auto origin_it = request.headers.find("Origin");
+        if (origin_it != request.headers.end()) {
+            origin = origin_it->second;
+        }
+        addCorsHeaders(response, cors_config_, origin);
+    }
 }
 
 void HttpServer2::buildAndSendResponse(tcp::socket& socket,
@@ -459,13 +474,18 @@ void HttpServer2::buildAndSendResponse(std::shared_ptr<ssl::stream<tcp::socket>>
                                         const std::string& client_ip,
                                         const std::string& path,
                                         bool /* keep_alive */,
-                                        bool should_compress) {
+                                        bool should_compress,
+                                        std::function<void()> on_complete) {
     // 如果响应已被流式发送，跳过
-    if (custom_response.response_sent) return;
+    if (custom_response.response_sent) {
+        if (on_complete) on_complete();
+        return;
+    }
     
     // 如果设置了 file_body_path，使用 sendfile 零拷贝发送
     if (!custom_response.file_body_path.empty()) {
         sendFileResponse(ssl_socket_ptr, custom_response, client_ip, path);
+        if (on_complete) on_complete();
         return;
     }
     
@@ -503,7 +523,7 @@ void HttpServer2::buildAndSendResponse(std::shared_ptr<ssl::stream<tcp::socket>>
     response->prepare_payload();
 
     http::async_write(*ssl_socket_ptr, *response,
-        [ssl_socket_ptr, response](beast::error_code ec, std::size_t) {
+        [ssl_socket_ptr, response, on_complete](beast::error_code ec, std::size_t) {
             boost::ignore_unused(ec, response);
             // SSL 安全关闭
             boost::system::error_code shut_ec;
@@ -511,6 +531,9 @@ void HttpServer2::buildAndSendResponse(std::shared_ptr<ssl::stream<tcp::socket>>
             if (ssl_socket_ptr->lowest_layer().is_open()) {
                 boost::system::error_code close_ec;
                 ssl_socket_ptr->lowest_layer().close(close_ec);
+            }
+            if (on_complete) {
+                on_complete();
             }
         }
     );
@@ -1258,435 +1281,318 @@ void HttpServer2::acceptConnection() {
     }
 }
 
-// 处理客户端连接（HTTP/1.1）
-void HttpServer2::handleClientHttp1(tcp::socket socket) {
-    // 创建调试信息对象（如果启用调试模式）
+// ============================================================
+// 统一的请求处理模板（消除 HTTP/HTTPS 重复代码）
+// ============================================================
+template <typename StreamType>
+void HttpServer2::handleClient(StreamType stream, bool use_ssl) {
+    active_connections_++;
+    
+    // 获取最低层 socket（SSL 流需要 .lowest_layer()）
+    auto getLowestLayer = [](auto& s) -> auto& {
+        if constexpr (std::is_same_v<std::decay_t<decltype(s)>, ssl::stream<tcp::socket>>) {
+            return s.lowest_layer();
+        } else {
+            return s;
+        }
+    };
+    
+    auto& lowest_layer = getLowestLayer(stream);
+    
+    // 创建调试信息对象
     std::shared_ptr<DebugInfo> debug_info;
     if (debug_mode_) {
         debug_info = std::make_shared<DebugInfo>();
         debug_info->start_time = std::chrono::steady_clock::now();
-        debug_info->client_ip = socket.remote_endpoint().address().to_string();
-        debug_info->client_port = socket.remote_endpoint().port();
+        debug_info->client_ip = lowest_layer.remote_endpoint().address().to_string();
+        debug_info->client_port = lowest_layer.remote_endpoint().port();
     }
     
-    // 记录请求开始
     PerformanceMonitor::recordRequest();
     
-    // 检查是否限流
-    bool rate_limited = false;
-    std::string client_ip = socket.remote_endpoint().address().to_string();
-    
+    // 检查限流
+    std::string client_ip = lowest_layer.remote_endpoint().address().to_string();
     if (requests_per_second_ > 0) {
-        // 检查全局限流
-        if (isRateLimited()) {
-            rate_limited = true;
-        } 
-        // 检查IP级别的限流
-        else if (!rate_limiter_.isAllowed(client_ip)) {
-            rate_limited = true;
-        }
-    }
-    
-    if (rate_limited) {
-        try {
-            // 发送429 Too Many Requests响应
-            http::response<http::string_body> response;
-            response.version(11);
-            response.result(http::status::too_many_requests);
-            response.set(http::field::content_type, "text/plain");
-            response.set(http::field::retry_after, "60");
-            response.body() = "Too many requests, please try again later.";
-            response.prepare_payload();
-            
-            http::write(socket, response);
-            boost::system::error_code ec;
-            socket.shutdown(tcp::socket::shutdown_send, ec);
-        } catch (...) {
-            // 忽略错误
-        }
-        return;
-    }
-
-    // 创建socket的shared_ptr以便在异步操作中保持其生命周期
-    auto socket_ptr = std::make_shared<tcp::socket>(std::move(socket));
-    // 确保socket有效
-    if (!socket_ptr || !socket_ptr->is_open()) {
-        LOG_ERROR("Invalid socket, closing connection");
-        return;
-    }
-    
-    // 创建连接状态对象，管理所有相关资源
-    struct ConnectionState {
-        std::shared_ptr<tcp::socket> socket;
-        beast::flat_buffer buffer; // 避免shared_ptr，减少引用计数开销
-        net::deadline_timer timer;
-        http::request_parser<http::string_body> parser; // 避免shared_ptr，直接存储
-        
-        ConnectionState(std::shared_ptr<tcp::socket> s, size_t max_size) 
-            : socket(std::move(s)), 
-              buffer(8192), // 预分配8KB缓冲区
-              timer(socket->get_executor()),
-              parser()
-        {
-            // 使用服务器配置的最大请求大小限制
-            parser.body_limit(max_size);
-        }
-    };
-    
-    auto state = std::make_shared<ConnectionState>(socket_ptr, max_request_size_);
-    
-    // 设置超时时间
-    std::chrono::seconds timeout = request_timeout_;
-    if (timeout.count() <= 0) {
-        timeout = std::chrono::seconds(60); // 默认60秒
-    }
-    state->timer.expires_from_now(boost::posix_time::seconds(timeout.count()));
-    
-    // 设置超时回调
-    state->timer.async_wait([state](const boost::system::error_code& ec) {
-        if (!ec) { // 如果定时器没有被取消，则超时
+        if (isRateLimited() || !rate_limiter_.isAllowed(client_ip)) {
             try {
-                if (state->socket && state->socket->is_open()) {
+                http::response<http::string_body> response;
+                response.version(11);
+                response.result(http::status::too_many_requests);
+                response.set(http::field::content_type, "text/plain");
+                response.set(http::field::retry_after, "60");
+                response.body() = "Too many requests, please try again later.";
+                response.prepare_payload();
+                http::write(stream, response);
+                lowest_layer.shutdown(tcp::socket::shutdown_send);
+            } catch (...) {}
+            active_connections_--;
+            return;
+        }
+    }
+    
+    // 创建 shared_ptr 管理流生命周期
+    auto stream_ptr = std::make_shared<StreamType>(std::move(stream));
+    auto buffer = std::make_shared<beast::flat_buffer>(8192);
+    auto parser = std::make_shared<http::request_parser<http::string_body>>();
+    parser->body_limit(max_request_size_);
+    
+    auto timer = std::make_shared<net::deadline_timer>(*io_contexts_[0]);
+    std::chrono::seconds timeout = request_timeout_;
+    if (timeout.count() <= 0) timeout = std::chrono::seconds(60);
+    timer->expires_from_now(boost::posix_time::seconds(timeout.count()));
+    
+    timer->async_wait([stream_ptr](const boost::system::error_code& ec) {
+        if (!ec) {
+            try {
+                auto& ll = [&]() -> auto& {
+                    if constexpr (std::is_same_v<StreamType, ssl::stream<tcp::socket>>) {
+                        return stream_ptr->lowest_layer();
+                    } else {
+                        return *stream_ptr;
+                    }
+                }();
+                if (ll.is_open()) {
                     boost::system::error_code close_ec;
-                    state->socket->shutdown(tcp::socket::shutdown_both, close_ec);
-                    state->socket->close(close_ec);
+                    ll.shutdown(tcp::socket::shutdown_both, close_ec);
+                    ll.close(close_ec);
                 }
-            } catch (...) {
-                // 忽略关闭时的异常
-            }
+            } catch (...) {}
         }
     });
     
-    // 开始异步读取请求
-            http::async_read(*state->socket, state->buffer, state->parser, 
-                [this, state, socket_ptr, debug_info](beast::error_code ec, std::size_t bytes_transferred) {
-                    // 取消定时器
-                    boost::system::error_code timer_ec;
-                    state->timer.cancel(timer_ec);
-                    
-                    boost::ignore_unused(bytes_transferred);
-                    
-                    // 检查是否因为请求体过大而导致读取错误
-                    if (ec && ec == http::error::body_limit) {
-                        LOG_WARNING("Request body limit exceeded during parsing");
-                        try {
-                            http::response<http::string_body> response;
-                            response.result(http::status::payload_too_large);
-                            response.body() = "Request body exceeds maximum allowed size"; // 413 Payload Too Large
-                            response.prepare_payload();
-                            response.set(http::field::connection, "close");
-                            
-                            boost::system::error_code write_ec;
-                            http::write(*state->socket, response, write_ec);
-                            
-                            if (state->socket->is_open()) {
-                                boost::system::error_code close_ec;
-                                state->socket->close(close_ec);
-                            }
-                        } catch (...) {
-                            // 忽略错误
-                        }
+    // 异步读取请求
+    http::async_read(*stream_ptr, *buffer, *parser,
+        [this, stream_ptr, buffer, parser, timer, debug_info, use_ssl](beast::error_code ec, std::size_t bytes_transferred) {
+            boost::system::error_code timer_ec;
+            timer->cancel(timer_ec);
+            boost::ignore_unused(bytes_transferred);
+            
+            auto& ll = [&]() -> auto& {
+                if constexpr (std::is_same_v<StreamType, ssl::stream<tcp::socket>>) {
+                    return stream_ptr->lowest_layer();
+                } else {
+                    return *stream_ptr;
+                }
+            }();
+            
+            if (ec && ec == http::error::body_limit) {
+                LOG_WARNING("Request body limit exceeded");
+                try {
+                    http::response<http::string_body> r;
+                    r.result(http::status::payload_too_large);
+                    r.body() = "Request body exceeds maximum allowed size";
+                    r.prepare_payload(); r.set(http::field::connection, "close");
+                    http::write(*stream_ptr, r);
+                    if (ll.is_open()) ll.close();
+                } catch (...) {}
+                active_connections_--;
+                return;
+            }
+            if (ec) {
+                if (ec != http::error::end_of_stream) LOG_ERROR("Read error: " + ec.message());
+                active_connections_--;
+                return;
+            }
+            
+            try {
+                const auto& beast_request = parser->get();
+                
+                // 请求大小检查
+                if (beast_request.body().size() > max_request_size_) {
+                    LOG_WARNING("Request body too large: " + std::to_string(beast_request.body().size()));
+                    http::response<http::string_body> r;
+                    r.result(http::status::payload_too_large);
+                    r.body() = "Request body exceeds maximum allowed size";
+                    r.prepare_payload(); r.set(http::field::connection, "close");
+                    http::write(*stream_ptr, r);
+                    if (ll.is_open()) ll.close();
+                    active_connections_--;
+                    return;
+                }
+                
+                // 基本认证
+                if (!basic_auth_realm_.empty()) {
+                    auto auth_it = beast_request.find(http::field::authorization);
+                    std::string auth_h = (auth_it != beast_request.end()) ? std::string(auth_it->value()) : "";
+                    if (!validateBasicAuth(auth_h)) {
+                        http::response<http::string_body> r;
+                        r.result(http::status::unauthorized);
+                        r.set(http::field::www_authenticate, "Basic realm=\"" + basic_auth_realm_ + "\"");
+                        r.body() = "Unauthorized"; r.prepare_payload();
+                        http::write(*stream_ptr, r);
+                        if (ll.is_open()) ll.close();
+                        active_connections_--;
                         return;
                     }
-                    
-                    if (!ec) {
-                        try {
-                    // 获取解析结果
-                    const auto& beast_request = state->parser.get();
-                    // 将Beast请求转换为自定义请求格式
-                    auto custom_request = std::make_shared<HttpRequest>(convertFromBeastRequest(beast_request));
-                    // 生成唯一请求 ID
-                    static std::atomic<uint64_t> req_counter{0};
-                    uint64_t seq = req_counter++;
-                    auto now_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                        std::chrono::steady_clock::now().time_since_epoch()).count();
-                    std::stringstream rid_ss;
-                    rid_ss << std::hex << now_us << "-" << std::hex << seq;
-                    custom_request->request_id = rid_ss.str();
-                    // 附加客户端 socket（供反向代理流式转发使用）
-                    custom_request->client_socket = state->socket;
-
-                    // 请求大小检查 - 移到最前面，确保大文件请求先被拒绝
-                    if (beast_request.body().size() > max_request_size_) {
-                        LOG_WARNING("Request body too large: " + std::to_string(beast_request.body().size()) + 
-                                " bytes (max: " + std::to_string(max_request_size_) + " bytes)");
-                        http::response<http::string_body> response;
-                        response.result(http::status::payload_too_large);
-                        response.body() = "Request body exceeds maximum allowed size";
-                        response.prepare_payload();
-                        response.set(http::field::connection, "close");
-                        
-                        boost::system::error_code write_ec;
-                        http::write(*state->socket, response, write_ec);
-                        
-                        if (state->socket->is_open()) {
-                            boost::system::error_code close_ec;
-                            state->socket->close(close_ec);
-                        }
-                        return;
-                    }
-                    
-                    // 检查是否需要基本认证
-                    if (!basic_auth_realm_.empty()) {
-                        auto auth_header_it = beast_request.find(http::field::authorization);
-                        std::string auth_header;
-                        
-                        if (auth_header_it != beast_request.end()) {
-                            auth_header = std::string(auth_header_it->value().begin(), auth_header_it->value().end());
-                        }
-                        
-                        if (!validateBasicAuth(auth_header)) {
-                            // 创建响应对象，确保包含调试头信息
-                            HttpResponse response_with_debug;
-                            response_with_debug.status_code = "401";
-                            response_with_debug.body = "Unauthorized";
-                            response_with_debug.headers["WWW-Authenticate"] = "Basic realm=\"" + basic_auth_realm_ + "\"";
-                            
-                            // 添加调试头信息
-                            if (this->debug_mode_) {
-                                std::shared_ptr<DebugInfo> local_debug_info = debug_info;
-                                if (!local_debug_info) {
-                                    // 如果debug_info为空但调试模式已启用，创建临时对象
-                                    local_debug_info = std::make_shared<DebugInfo>();
-                                    local_debug_info->start_time = std::chrono::steady_clock::now();
-                                    local_debug_info->end_time = std::chrono::steady_clock::now();
-                                    local_debug_info->client_ip = state->socket->remote_endpoint().address().to_string();
-                                    local_debug_info->routing_time = std::chrono::milliseconds(0);
+                }
+                
+                // 转换请求
+                HttpRequest custom_request = convertFromBeastRequest(beast_request);
+                static std::atomic<uint64_t> req_counter{0};
+                uint64_t seq = req_counter++;
+                auto now_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count();
+                std::stringstream rid_ss; rid_ss << std::hex << now_us << "-" << std::hex << seq;
+                custom_request.request_id = rid_ss.str();
+                
+                // WebSocket 升级检测（仅对非 SSL 连接编译）
+                if constexpr (std::is_same_v<StreamType, tcp::socket>) {
+                    auto upgrade_it = beast_request.find(http::field::upgrade);
+                    if (upgrade_it != beast_request.end()) {
+                        std::string upgrade_val(upgrade_it->value());
+                        if (upgrade_val == "websocket" || upgrade_val == "WebSocket") {
+                            auto ws_it = ws_handlers_.find(custom_request.path);
+                            if (ws_it != ws_handlers_.end()) {
+                                std::unordered_map<std::string, std::string> query_params;
+                                auto target = beast_request.target();
+                                std::string target_str(target.data(), target.size());
+                                auto qpos = target_str.find('?');
+                                if (qpos != std::string::npos) {
+                                    parseQueryParams(target_str.substr(qpos + 1), query_params);
                                 }
-                                
-                                // 更新结束时间
-                                local_debug_info->end_time = std::chrono::steady_clock::now();
-                                
-                                // 添加调试头信息
-                                auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(local_debug_info->end_time - local_debug_info->start_time);
-                                response_with_debug.headers["X-Debug-Time"] = std::to_string(duration.count()) + "ms";
-                                response_with_debug.headers["X-Debug-Client-IP"] = local_debug_info->client_ip;
-                                response_with_debug.headers["X-Debug-Route-Time"] = std::to_string(local_debug_info->routing_time.count()) + "ms";
+                                namespace beast_ws = boost::beast::websocket;
+                                auto ws_stream = std::make_shared<beast_ws::stream<tcp::socket>>(std::move(*stream_ptr));
+                                try {
+                                    ws_stream->accept(beast_request);
+                                    std::random_device rd;
+                                    std::mt19937_64 gen(rd());
+                                    std::stringstream ss;
+                                    ss << std::hex << gen();
+                                    std::string ws_id = ss.str();
+                                    std::string client_ip = ll.remote_endpoint().address().to_string();
+                                    auto ws_session = std::make_shared<http2::ws::WebSocketSession>(
+                                                                            ws_stream, ws_id, custom_request.headers, query_params,
+                                                                            client_ip, *ws_it->second);
+                                    http2::ws::g_ws_manager.add(ws_session);
+                                    ws_session->start();
+                                    return;
+                                } catch (const std::exception& e) {
+                                    LOG_ERROR("WebSocket upgrade failed: " + std::string(e.what()));
+                                    if (ll.is_open()) ll.close();
+                                    active_connections_--;
+                                    return;
+                                }
                             }
-                            
-                            // 直接创建响应对象并发送
-                            auto response = std::make_shared<http::response<http::string_body>>();
-                            response->result(http::status::unauthorized);
-                            response->body() = response_with_debug.body;
-                            
-                            // 添加所有响应头
-                            for (const auto& [key, value] : response_with_debug.headers) {
-                                response->set(key, value);
-                            }
-                            
-                            // 添加服务器和日期头
-                            response->set(http::field::server, "BoostBeastHttpServer/2.0");
-                            auto system_now = std::chrono::system_clock::now();
-                            auto now_c = std::chrono::system_clock::to_time_t(system_now);
-                            std::stringstream date_ss;
-                            date_ss << std::put_time(gmtime(&now_c), "%a, %d %b %Y %H:%M:%S GMT");
-                            response->set(http::field::date, date_ss.str());
-                            
-                            // 自动设置Content-Length
-                            response->prepare_payload();
-                            
-                            boost::system::error_code write_ec;
-                            http::write(*state->socket, *response, write_ec);
-                            
-                            if (state->socket->is_open()) {
-                                boost::system::error_code close_ec;
-                                state->socket->close(close_ec);
-                            }
+                        }
+                    }
+                }
+                
+                // CSRF 检查
+                if (csrf_protection_enabled_) {
+                    HttpResponse csrf_resp; addCsrfTokenToResponse(csrf_resp, custom_request);
+                    std::string method = std::string(beast_request.method_string());
+                    if (method == "POST" || method == "PUT" || method == "DELETE" || method == "PATCH") {
+                        if (!validateCsrfToken(custom_request)) {
+                            HttpResponse http_resp = createErrorResponse(HttpErrorType::FORBIDDEN, "CSRF token validation failed");
+                            http::response<http::string_body> r;
+                            r.version(11); r.result(http::status::forbidden);
+                            r.set(http::field::content_type, "application/json");
+                            r.body() = http_resp.body; r.prepare_payload();
+                            http::write(*stream_ptr, r);
+                            if (ll.is_open()) ll.close();
+                            active_connections_--;
                             return;
                         }
                     }
-                    
-                    // 检查CSRF令牌（如果启用）— 复用已转换的 custom_request
-                    if (csrf_protection_enabled_ && custom_request) {
-                        
-                        // 对于所有请求类型，确保CSRF令牌被添加到响应中
-                        HttpResponse csrf_response;
-                        addCsrfTokenToResponse(csrf_response, *custom_request);
-                        
-                        // 只对修改操作进行CSRF验证
-                        auto method = std::string(beast_request.method_string());
-                        if (method == "POST" || method == "PUT" || method == "DELETE" || method == "PATCH") {
-                            if (!validateCsrfToken(*custom_request)) {
-                                // 返回403禁止访问，使用统一的错误响应格式
-                                HttpResponse http_response = createErrorResponse(HttpErrorType::FORBIDDEN, "CSRF token validation failed");
-                                
-                                // 直接构建http::response对象，不使用模板函数
-                                http::response<http::string_body> beast_response;
-                                beast_response.version(11); // HTTP/1.1
-                                beast_response.result(http::status::forbidden);
-                                beast_response.set(http::field::content_type, "application/json");
-                                beast_response.body() = http_response.body;
-                                beast_response.prepare_payload();
-                                
-                                boost::system::error_code write_ec;
-                                http::write(*state->socket, beast_response, write_ec);
-                                
-                                if (state->socket->is_open()) {
-                                    boost::system::error_code close_ec;
-                                    state->socket->close(close_ec);
-                                }
-                                return;
+                }
+                
+                // 路由查找
+                std::unordered_map<std::string, std::string> path_params;
+                auto host_it = custom_request.headers.find("Host");
+                if (host_it != custom_request.headers.end()) path_params["host"] = host_it->second;
+                
+                auto route_start = std::chrono::steady_clock::now();
+                auto route_handler = findRoute(custom_request.method, custom_request.path, path_params);
+                for (const auto& [k, v] : path_params) custom_request.path_params[k] = v;
+                
+                // 处理请求（中间件链 + 路由处理器）
+                HttpResponse custom_response;
+                if (route_handler) {
+                    custom_response = handleMiddlewareChain(custom_request, global_middlewares_, 0, route_handler->handler);
+                    if (custom_response.status_code == "404")
+                        custom_response = route_handler->handler(custom_request);
+                } else {
+                    custom_response = defaultHandler(custom_request);
+                }
+                
+                if (debug_info) {
+                    debug_info->routing_time = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - route_start);
+                }
+                
+                // 性能记录
+                int response_time = debug_info ? std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - debug_info->start_time).count() : 0;
+                PerformanceMonitor::recordResponse(custom_request.path, response_time, 
+                    custom_response.body.size(), std::atoi(custom_response.status_code.c_str()) < 400);
+                
+                // 调试头
+                if (debug_mode_ && debug_info) {
+                    debug_info->end_time = std::chrono::steady_clock::now();
+                    auto td = std::chrono::duration_cast<std::chrono::milliseconds>(debug_info->end_time - debug_info->start_time);
+                    custom_response.headers["X-Debug-Time"] = std::to_string(td.count()) + "ms";
+                    custom_response.headers["X-Debug-Client-IP"] = debug_info->client_ip;
+                    custom_response.headers["X-Debug-Route-Time"] = std::to_string(debug_info->routing_time.count()) + "ms";
+                }
+                
+                // 访问日志
+                if (debug_info) {
+                    auto dur = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - debug_info->start_time);
+                    logAccess(debug_info->client_ip, custom_request.path, custom_request.method,
+                             custom_response.status_code,
+                             custom_request.headers.count("User-Agent") ? custom_request.headers["User-Agent"] : ":", 
+                             dur.count(), custom_request.request_id);
+                }
+                
+                // 最终处理（CSRF cookie + 安全头 + 调试头 + CORS）
+                finalizeResponse(custom_response, custom_request, use_ssl, debug_info);
+                
+                // gzip 检查
+                bool should_compress = false;
+                auto ae_it = beast_request.find(http::field::accept_encoding);
+                if (ae_it != beast_request.end()) {
+                    if (std::string(ae_it->value()).find("gzip") != std::string::npos)
+                        should_compress = true;
+                }
+                
+                bool keep_alive = beast_request.keep_alive();
+                
+                // 发送响应
+                if constexpr (std::is_same_v<StreamType, ssl::stream<tcp::socket>>) {
+                    buildAndSendResponse(stream_ptr, custom_response,
+                        debug_info ? debug_info->client_ip : "unknown",
+                        custom_request.path, false, should_compress,
+                        [this]() { active_connections_--; });
+                } else {
+                    auto on_complete = keep_alive ? std::function<void()>([this, stream_ptr]() {
+                        active_connections_--;
+                        if (stream_ptr && stream_ptr->is_open() && !shutdown_in_progress_) {
+                            try {
+                                handleClient(std::move(*stream_ptr), false);
+                            } catch (const std::exception& e) {
+                                LOG_ERROR("Keep-Alive restart error: " + std::string(e.what()));
+                                active_connections_--;
                             }
                         }
-                    }
-                
-                // 检查连接是否可以重用（是否支持keep-alive）
-                // 注意：当前队列架构每个请求独占一个连接，强制 keep_alive=false
-                // 如需 Keep-Alive 支持需改为非队列的处理架构
-                bool keep_alive = false; // beast_request.keep_alive();
+                    }) : std::function<void()>([this]() { active_connections_--; });
                     
-                    // 检查队列是否已满
-                    bool queue_full = false;
-                    {
-                        std::lock_guard<std::mutex> lock(queue_mutex_);
-                        queue_full = request_queue_.size() >= max_queue_size_;
-                    }
-                    
-                    if (queue_full) {
-                        // 队列已满，拒绝请求
-                        http::response<http::string_body> response;
-                        response.result(http::status::service_unavailable);
-                        response.body() = "Service Unavailable - Queue full";
-                        response.prepare_payload();
-                        
-                        boost::system::error_code write_ec;
-                        http::write(*state->socket, response, write_ec);
-                        
-                        if (state->socket->is_open()) {
-                            boost::system::error_code close_ec;
-                            state->socket->close(close_ec);
-                        }
-                    } else {
-                        // 将请求添加到队列
-                        {
-                            std::lock_guard<std::mutex> lock(queue_mutex_);
-                            RequestQueueItem queue_item;
-                            queue_item.request = custom_request;
-                            
-                            // 创建回调函数 — 按值捕获所需成员变量，避免捕获 this 指针
-                            queue_item.callback = [socket = state->socket, keep_alive, debug_info_copy = debug_info, 
-                                                   debug_mode = debug_mode_, csrf_enabled = csrf_protection_enabled_,
-                                                   csrf_cookie = csrf_cookie_name_, use_ssl = use_ssl_,
-                                                   custom_request](const HttpResponse& http_response) {
-                                // 记录响应信息
-                                auto response_time = 0;
-                                if (debug_info_copy) {
-                                    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - debug_info_copy->start_time);
-                                    response_time = duration.count();
-                                }
-                                bool is_success = std::atoi(http_response.status_code.c_str()) < 400;
-                                PerformanceMonitor::recordResponse("/", response_time, http_response.body.size(), is_success);
-                                
-                                // 记录访问日志
-                                auto now = std::chrono::steady_clock::now();
-                                if (debug_info_copy) {
-                                    debug_info_copy->end_time = now;
-                                    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(debug_info_copy->end_time - debug_info_copy->start_time);
-                                    logAccess(debug_info_copy->client_ip, custom_request->method, custom_request->path,
-                                             http_response.status_code,
-                                             custom_request->headers.count("User-Agent") ? custom_request->headers["User-Agent"] : ":",
-                                             duration.count(), custom_request->request_id);
-                                }
-                                
-                                // 创建响应副本，准备添加调试信息
-                                HttpResponse response_with_debug = http_response;
-                                
-                                // 确保debug_info对象存在，如果不存在则创建临时对象
-                                if (debug_mode) {
-                                    std::shared_ptr<DebugInfo> local_debug_info = debug_info_copy;
-                                    if (!local_debug_info) {
-                                        // 如果debug_info为空但调试模式已启用，创建临时对象
-                                        local_debug_info = std::make_shared<DebugInfo>();
-                                        local_debug_info->start_time = std::chrono::steady_clock::now();
-                                        local_debug_info->end_time = std::chrono::steady_clock::now();
-                                        local_debug_info->client_ip = "127.0.0.1"; // 默认本地IP
-                                        local_debug_info->routing_time = std::chrono::milliseconds(0);
-                                    }
-                                    
-                                    // 添加调试头信息
-                                    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(local_debug_info->end_time - local_debug_info->start_time);
-                                    response_with_debug.headers["X-Debug-Time"] = std::to_string(duration.count()) + "ms";
-                                    response_with_debug.headers["X-Debug-Client-IP"] = local_debug_info->client_ip;
-                                    response_with_debug.headers["X-Debug-Route-Time"] = std::to_string(local_debug_info->routing_time.count()) + "ms";
-                                    LOG_DEBUG("Debug headers added to response: X-Debug-Time=" + response_with_debug.headers["X-Debug-Time"] + ", X-Debug-Client-IP=" + response_with_debug.headers["X-Debug-Client-IP"]);
-                                }
-                                
-                                // 如果启用了CSRF保护，添加CSRF令牌到响应cookie中（内联逻辑，避免依赖 this）
-                                if (csrf_enabled) {
-                                    // 检查请求是否已包含 CSRF cookie
-                                    bool has_csrf_cookie = false;
-                                    auto cookie_it = custom_request->headers.find("Cookie");
-                                    if (cookie_it != custom_request->headers.end()) {
-                                        has_csrf_cookie = (cookie_it->second.find(csrf_cookie + "=") != std::string::npos);
-                                    }
-                                    if (!has_csrf_cookie) {
-                                        // 生成随机令牌
-                                        const std::string charset = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
-                                        std::random_device rd;
-                                        std::mt19937 gen(rd());
-                                        std::uniform_int_distribution<> distrib(0, charset.size() - 1);
-                                        std::string csrf_token;
-                                        csrf_token.reserve(32);
-                                        for (int i = 0; i < 32; ++i) {
-                                            csrf_token += charset[distrib(gen)];
-                                        }
-                                        response_with_debug.headers["Set-Cookie"] = csrf_cookie + "=" + csrf_token + "; HttpOnly=false; SameSite=Strict; Path=/" + (use_ssl ? "; Secure" : "");
-                                    }
-                                }
-                                
-                                // 添加安全头
-                                addSecurityHeaders(response_with_debug, use_ssl);
-                                
-                                try {
-                                    // 确保socket有效且打开
-                                    if (!socket || !socket->is_open()) {
-                                        return;
-                                    }
-                                    
-                                    // 检查请求头中的Accept-Encoding，看看客户端是否支持gzip压缩
-                                    bool should_compress = false;
-                                    auto accept_encoding_it = custom_request->headers.find("Accept-Encoding");
-                                    if (accept_encoding_it != custom_request->headers.end()) {
-                                        const std::string& accept_encoding = accept_encoding_it->second;
-                                        if (accept_encoding.find("gzip") != std::string::npos) {
-                                            should_compress = true;
-                                        }
-                                    }
-                                    
-                                    // 统一构建并发送响应（Keep-Alive 时传入 on_complete）
-                                    buildAndSendResponse(*socket, response_with_debug, 
-                                                          debug_info_copy ? debug_info_copy->client_ip : "unknown",
-                                                          custom_request->path, keep_alive, should_compress);
-                                } catch (const std::exception& e) {
-                                    try {
-                                        if (socket && socket->is_open()) {
-                                            boost::system::error_code ec;
-                                            socket->close(ec);
-                                        }
-                                    } catch (...) {
-                                        // 忽略错误
-                                    }
-                                }
-                            };
-                            request_queue_.push(queue_item);
-                        }
-                        queue_cv_.notify_one();  // 通知处理线程
-                    }
-                } catch (const std::exception& e) {
-                    LOG_ERROR("Client handling error: " + std::string(e.what()));
-                    try {
-                        if (socket_ptr->is_open()) {
-                            socket_ptr->close();
-                        }
-                    } catch (...) {
-                        // 忽略关闭时的错误
-                    }
+                    buildAndSendResponse(*stream_ptr, custom_response,
+                        debug_info ? debug_info->client_ip : "unknown",
+                        custom_request.path, keep_alive, should_compress, on_complete);
                 }
-            } else if (ec != http::error::end_of_stream) {
-                LOG_ERROR("Read error: " + ec.message());
+            } catch (const std::exception& e) {
+                LOG_ERROR("Client handling error: " + std::string(e.what()));
+                try { if (ll.is_open()) ll.close(); } catch (...) {}
+                active_connections_--;
             }
         }
     );
+}
+
+// 处理客户端连接（HTTP/1.1）— 委托给模板函数
+void HttpServer2::handleClientHttp1(tcp::socket socket) {
+    handleClient(std::move(socket), false);
 }
 
 // 默认GET方法的路由注册通过get()方法提供
@@ -1957,6 +1863,7 @@ void HttpServer2::stop() {
     if (!running_) return;
     
     running_ = false;  // 设置原子变量为false，所有线程都能立即看到
+    shutdown_in_progress_ = true;
     std::cout << "HTTP Server stopping..." << std::endl;
     
     // 关闭acceptor
@@ -1970,6 +1877,20 @@ void HttpServer2::stop() {
     {
         std::lock_guard<std::mutex> queue_lock(queue_mutex_);
         queue_cv_.notify_all();
+    }
+    
+    // 等待活跃连接完成（最多等30秒）
+    if (active_connections_ > 0) {
+        std::cout << "Waiting for " << active_connections_ << " active connections to complete..." << std::endl;
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+        while (active_connections_ > 0 && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        if (active_connections_ > 0) {
+            std::cout << "Graceful shutdown timeout: " << active_connections_ << " connections still active, forcing shutdown." << std::endl;
+        } else {
+            std::cout << "All active connections completed." << std::endl;
+        }
     }
     
     // 停止所有io_context
@@ -2407,307 +2328,8 @@ HttpResponse HttpServer2::defaultHandler(const HttpRequest& request) {
 
 // 处理客户端连接（HTTPS/1.1）
 void HttpServer2::handleClientHttps(ssl::stream<tcp::socket> ssl_socket) {
-    // 创建调试信息对象（如果启用调试模式）
-    std::shared_ptr<DebugInfo> debug_info;
-    if (debug_mode_) {
-        debug_info = std::make_shared<DebugInfo>();
-        debug_info->start_time = std::chrono::steady_clock::now();
-        debug_info->client_ip = ssl_socket.lowest_layer().remote_endpoint().address().to_string();
-        debug_info->client_port = ssl_socket.lowest_layer().remote_endpoint().port();
-    }
-    
-    // 记录请求开始
-    PerformanceMonitor::recordRequest();
-    
-    // 检查IP级别的限流
-    std::string client_ip = ssl_socket.lowest_layer().remote_endpoint().address().to_string();
-    bool rate_limited = false;
-    
-    if (requests_per_second_ > 0) {
-        // 检查全局限流
-        if (isRateLimited()) {
-            rate_limited = true;
-        } 
-        // 检查IP级别的限流
-        else if (!rate_limiter_.isAllowed(client_ip)) {
-            rate_limited = true;
-        }
-    }
-    
-    if (rate_limited) {
-        try {
-            // 发送429 Too Many Requests响应
-            http::response<http::string_body> response;
-            response.version(11);
-            response.result(http::status::too_many_requests);
-            response.set(http::field::content_type, "text/plain");
-            response.set(http::field::retry_after, "60");
-            response.body() = "Too many requests, please try again later.";
-            response.prepare_payload();
-            
-            http::write(ssl_socket, response);
-            boost::system::error_code ec;
-            ssl_socket.lowest_layer().shutdown(tcp::socket::shutdown_send, ec);
-        } catch (...) {
-            // 忽略错误
-        }
-        return;
-    }
-    
-    // 创建ssl_socket的shared_ptr以便在异步操作中保持其生命周期
-    // 使用new直接构造，避免make_shared对move-only类型的不兼容
-    auto ssl_socket_ptr = std::shared_ptr<ssl::stream<tcp::socket>>(
-        new ssl::stream<tcp::socket>(std::move(ssl_socket)));
-    
-    auto buffer = std::make_shared<beast::flat_buffer>();
-    auto request = std::make_shared<http::request<http::string_body>>();
-    // 创建定时器用于请求超时控制
-    // 直接创建timer，不再有条件块限制作用域
-    auto timer = std::make_shared<net::deadline_timer>(*io_contexts_[0]);
-    
-    // 设置超时时间
-    std::chrono::seconds timeout = request_timeout_;
-    if (timeout.count() <= 0) {
-        timeout = std::chrono::seconds(60); // 默认60秒
-    }
-    timer->expires_from_now(boost::posix_time::seconds(timeout.count()));
-    
-    // 设置超时回调
-    timer->async_wait([ssl_socket_ptr, timer](const boost::system::error_code& ec) {
-        if (!ec) { // 如果定时器没有被取消，则超时
-            LOG_WARNING("HTTPS Request timeout, closing connection");
-            try {
-                if (ssl_socket_ptr->lowest_layer().is_open()) {
-                    boost::system::error_code close_ec;
-                    ssl_socket_ptr->lowest_layer().shutdown(tcp::socket::shutdown_both, close_ec);
-                    ssl_socket_ptr->lowest_layer().close(close_ec);
-                }
-            } catch (...) {
-                // 忽略关闭时的异常
-            }
-        }
-    });
-    
-    // 异步读取HTTPS请求
-    http::async_read(*ssl_socket_ptr, *buffer, *request, 
-        [this, ssl_socket_ptr, buffer, request, timer, debug_info](beast::error_code ec, std::size_t bytes_transferred) {
-            // 取消定时器，因为我们已经开始处理请求
-            boost::system::error_code timer_ec;
-            timer->cancel(timer_ec);
-            
-            boost::ignore_unused(bytes_transferred);
-            
-            if (!ec) {
-                try {
-                    // 请求大小检查 - 移到最前面，确保大文件请求先被拒绝
-                    if (request->body().size() > max_request_size_) {
-                        LOG_WARNING("HTTPS request body too large: " + std::to_string(request->body().size()) + 
-                                " bytes (max: " + std::to_string(max_request_size_) + " bytes)");
-                        auto response = std::make_shared<http::response<http::string_body>>();
-                        response->result(http::status::payload_too_large);
-                        response->body() = "Request body exceeds maximum allowed size";
-                        response->prepare_payload();
-                        response->set(http::field::connection, "close");
-                        
-                        http::async_write(*ssl_socket_ptr, *response, 
-                            [ssl_socket_ptr, response](beast::error_code /* ec */, std::size_t /* bytes_transferred */) {
-                                
-                                try {
-                                    if (ssl_socket_ptr->lowest_layer().is_open()) {
-                                        boost::system::error_code close_ec;
-                                        ssl_socket_ptr->lowest_layer().close(close_ec);
-                                    }
-                                } catch (...) {
-                                    // 忽略关闭时的异常
-                                }
-                            }
-                        );
-                        return;
-                    }
-                    
-                    // 检查是否需要基本认证
-                    if (!basic_auth_realm_.empty()) {
-                        auto auth_header_it = request->find(http::field::authorization);
-                        std::string auth_header;
-                        
-                        if (auth_header_it != request->end()) {
-                            auth_header = std::string(auth_header_it->value().begin(), auth_header_it->value().end());
-                        }
-                        
-                        if (!validateBasicAuth(auth_header)) {
-                            // 返回401未授权
-                            auto response = std::make_shared<http::response<http::string_body>>();
-                            response->result(http::status::unauthorized);
-                            response->set(http::field::www_authenticate, "Basic realm=\"" + basic_auth_realm_ + "\"");
-                            response->body() = "Unauthorized";
-                            response->prepare_payload();
-                            
-                            http::async_write(*ssl_socket_ptr, *response, 
-                                [ssl_socket_ptr, response](beast::error_code /* ec */, std::size_t /* bytes_transferred */) {
-                                    
-                                    try {
-                                        if (ssl_socket_ptr->lowest_layer().is_open()) {
-                                            boost::system::error_code close_ec;
-                                            ssl_socket_ptr->lowest_layer().close(close_ec);
-                                        }
-                                    } catch (...) {
-                                        // 忽略关闭时的异常
-                                    }
-                                }
-                            );
-                            return;
-                        }
-                    }
-                    
-                    // 检查CSRF令牌（如果启用）
-                    if (csrf_protection_enabled_) {
-                        HttpRequest csrf_request = convertFromBeastRequest(*request);
-                        HttpResponse csrf_response;
-                        // 为所有请求添加CSRF令牌到响应cookie中
-                        addCsrfTokenToResponse(csrf_response, csrf_request);
-                        
-                        // 只对修改操作进行CSRF验证
-                        auto method = std::string(request->method_string());
-                        if (method == "POST" || method == "PUT" || method == "DELETE" || method == "PATCH") {
-                            if (!validateCsrfToken(csrf_request)) {
-                                // 返回403禁止访问，使用统一的错误响应格式
-                                HttpResponse http_response = createErrorResponse(HttpErrorType::FORBIDDEN, "CSRF token validation failed");
-                                auto response = std::make_shared<http::response<http::string_body>>();
-                                
-                                // 直接构建http::response对象，不使用模板函数
-                                response->version(11); // HTTP/1.1
-                                response->result(http::status::forbidden);
-                                response->set(http::field::content_type, "application/json");
-                                response->body() = http_response.body;
-                                response->prepare_payload();
-                                
-                                http::async_write(*ssl_socket_ptr, *response, 
-                                    [ssl_socket_ptr, response](beast::error_code /* ec */, std::size_t /* bytes_transferred */) {
-                                        
-                                        try {
-                                            if (ssl_socket_ptr->lowest_layer().is_open()) {
-                                                boost::system::error_code close_ec;
-                                                ssl_socket_ptr->lowest_layer().close(close_ec);
-                                            }
-                                        } catch (...) {
-                                            // 忽略关闭时的异常
-                                        }
-                                    }
-                                );
-                                return;
-                            }
-                        }
-                        // CSRF token is already added to response headers by addCsrfTokenToResponse
-                    }
-                    
-                    // 将Beast请求转换为自定义请求格式
-                    HttpRequest custom_request = convertFromBeastRequest(*request);
-                    // 生成唯一请求 ID
-                    static std::atomic<uint64_t> req_counter_ssl{0};
-                    uint64_t seq = req_counter_ssl++;
-                    auto now_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                        std::chrono::steady_clock::now().time_since_epoch()).count();
-                    std::stringstream rid_ss;
-                    rid_ss << std::hex << now_us << "-" << std::hex << seq;
-                    custom_request.request_id = rid_ss.str();
-                    
-                    // 创建路径参数映射
-                    std::unordered_map<std::string, std::string> path_params;
-                    // 设置虚拟主机匹配参数
-                    auto host_it = custom_request.headers.find("Host");
-                    if (host_it != custom_request.headers.end()) {
-                        path_params["host"] = host_it->second;
-                    }
-                    // 查找匹配的路由处理器
-                    auto route_handler = findRoute(custom_request.method, custom_request.path, path_params);
-                    // 将找到的路径参数添加到请求中
-                    for (const auto& [key, value] : path_params) {
-                        custom_request.path_params[key] = value;
-                    }
-                    
-                    // 检查是否找到路由处理器
-                    // 记录路由匹配时间（如果启用调试模式）
-                    auto route_start_time = std::chrono::steady_clock::now();
-                    
-                    HttpResponse custom_response;
-                    if (route_handler) {
-                        // 使用中间件链处理请求
-                        custom_response = handleMiddlewareChain(custom_request, global_middlewares_, 0, route_handler->handler);
-                        // 如果中间件链没有处理请求，使用路由处理器
-                        if (custom_response.status_code == "404") {
-                            custom_response = route_handler->handler(custom_request);
-                        }
-                    } else {
-                        // 使用默认处理器
-                        custom_response = defaultHandler(custom_request);
-                    }
-                    
-                    // 记录路由处理时间（如果启用调试模式）
-                    if (debug_info) {
-                        auto route_end_time = std::chrono::steady_clock::now();
-                        debug_info->routing_time = std::chrono::duration_cast<std::chrono::milliseconds>(route_end_time - route_start_time);
-                    }
-                    
-                    // 记录响应信息
-                    auto response_time = 0;
-                    if (debug_info) {
-                        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - debug_info->start_time);
-                        response_time = duration.count();
-                    }
-                    PerformanceMonitor::recordResponse(custom_request.path, response_time, custom_response.body.size(), custom_response.status_code < "400");
-                    
-                    // 如果启用调试模式，将调试信息添加到响应头
-                    if (debug_mode_ && debug_info) {
-                        auto now = std::chrono::steady_clock::now();
-                        debug_info->end_time = now;
-                        auto total_duration = std::chrono::duration_cast<std::chrono::milliseconds>(now - debug_info->start_time);
-                        custom_response.headers["X-Debug-Time"] = std::to_string(total_duration.count()) + "ms";
-                        custom_response.headers["X-Debug-Client-IP"] = debug_info->client_ip;
-                        custom_response.headers["X-Debug-Route-Time"] = std::to_string(debug_info->routing_time.count()) + "ms";
-                    }
-                    
-                    // 记录访问日志
-                    if (debug_info) {
-                        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - debug_info->start_time);
-                        logAccess(debug_info->client_ip, custom_request.path, custom_request.method, custom_response.status_code, 
-                                          custom_request.headers.count("User-Agent") ? custom_request.headers["User-Agent"] : ":", duration.count(),
-                                          custom_request.request_id);
-                    }
-                    
-                    // 统一处理：CSRF cookie + 安全头 + 调试头
-                    finalizeResponse(custom_response, custom_request, true, debug_info);
-                    
-                    // 检查客户端是否支持gzip压缩
-                    bool should_compress = false;
-                    auto accept_encoding_it = request->find(http::field::accept_encoding);
-                    if (accept_encoding_it != request->end()) {
-                        const std::string accept_encoding(accept_encoding_it->value());
-                        if (accept_encoding.find("gzip") != std::string::npos) {
-                            should_compress = true;
-                        }
-                    }
-                    
-                    // 统一构建并发送响应
-                    buildAndSendResponse(ssl_socket_ptr, custom_response,
-                                          debug_info ? debug_info->client_ip : "unknown",
-                                          custom_request.path, false, should_compress);
-                } catch (const std::exception& e) {
-                    LOG_ERROR("HTTPS client handling error: " + std::string(e.what()));
-                    try {
-                        if (ssl_socket_ptr->lowest_layer().is_open()) {
-                            ssl_socket_ptr->lowest_layer().close();
-                        }
-                    } catch (...) {
-                        // 忽略关闭时的错误
-                    }
-                }
-            } else if (ec != http::error::end_of_stream) {
-                LOG_ERROR("HTTPS read error: " + ec.message());
-            }
-        }
-    );
+    handleClient(std::move(ssl_socket), true);
 }
-
 // 初始化MIME类型映射
 void HttpServer2::initializeMimeTypes() {
     // 常见文件类型的MIME映射
@@ -2847,10 +2469,6 @@ std::string HttpServer2::getMimeType(const std::string& file_path) {
 // 提供静态文件
 HttpResponse HttpServer2::serveStaticFile(const HttpRequest& request, const std::string& url_path, const std::string& directory_path, const std::string& default_file) {
     HttpResponse response;
-    // 添加CORS支持
-    response.headers["Access-Control-Allow-Origin"] = "*";
-    response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS";
-    response.headers["Access-Control-Allow-Headers"] = "Content-Type";
     
     LOG_DEBUG("serveStaticFile - ENTRY - url_path: '" + url_path + "', directory_path: '" + directory_path + "', default_file: '" + default_file + "'");
     
@@ -3685,6 +3303,14 @@ void HttpServer2::addWebSocketProxy(const std::string& path, const std::string& 
     LOG_INFO("WebSocket proxy added: " + path + " -> " + target_url);
 }
 
+// ============================================================
+// 原生 WebSocket 端点注册
+// ============================================================
+void HttpServer2::addWebSocket(const std::string& path, const http2::ws::WebSocketHandler& handler) {
+    ws_handlers_[path] = std::make_shared<http2::ws::WebSocketHandler>(handler);
+    LOG_INFO("WebSocket endpoint registered: " + path);
+}
+
 // 调试模式开关
 // 调试模式开关
 void HttpServer2::enableDebugMode(bool enable) {
@@ -4222,6 +3848,75 @@ void HttpServer2::checkRequestSize(const HttpRequest& request) {
     if (request.body.size() > max_request_size_) {
         throw std::runtime_error("Request body too large: " + std::to_string(request.body.size()) + 
                                " bytes (max: " + std::to_string(max_request_size_) + " bytes)");
+    }
+}
+
+// ============================================================
+// CORS 支持
+// ============================================================
+void HttpServer2::enableCors(const CorsConfig& config) {
+    cors_config_ = config;
+    LOG_INFO("CORS enabled: origins=" + config.allowed_origins + 
+             ", methods=" + config.allowed_methods + 
+             ", credentials=" + (config.allow_credentials ? "true" : "false"));
+}
+
+void HttpServer2::setCorsOrigin(const std::string& origin) {
+    cors_config_.enabled = true;
+    cors_config_.allowed_origins = origin;
+    LOG_INFO("CORS origin set to: " + origin);
+}
+
+void HttpServer2::setCorsCredentials(bool allow) {
+    cors_config_.allow_credentials = allow;
+}
+
+// 添加 CORS 头到响应
+static void addCorsHeaders(HttpResponse& response, const CorsConfig& config, const std::string& request_origin) {
+    if (!config.enabled) return;
+    
+    // 处理通配符或特定 origin
+    if (config.allowed_origins == "*") {
+        response.headers["Access-Control-Allow-Origin"] = "*";
+    } else if (!request_origin.empty()) {
+        // 检查请求的 origin 是否在允许列表中
+        std::string origins = config.allowed_origins;
+        std::vector<std::string> origin_list;
+        size_t pos = 0;
+        while ((pos = origins.find(',')) != std::string::npos) {
+            std::string origin = origins.substr(0, pos);
+            origin.erase(0, origin.find_first_not_of(" \t"));
+            origin.erase(origin.find_last_not_of(" \t") + 1);
+            origin_list.push_back(origin);
+            origins.erase(0, pos + 1);
+        }
+        origins.erase(0, origins.find_first_not_of(" \t"));
+        origins.erase(origins.find_last_not_of(" \t") + 1);
+        if (!origins.empty()) origin_list.push_back(origins);
+        
+        for (const auto& allowed : origin_list) {
+            if (allowed == request_origin || allowed == "*") {
+                response.headers["Access-Control-Allow-Origin"] = request_origin;
+                break;
+            }
+        }
+    }
+    
+    response.headers["Access-Control-Allow-Methods"] = config.allowed_methods;
+    response.headers["Access-Control-Allow-Headers"] = config.allowed_headers;
+    response.headers["Access-Control-Max-Age"] = std::to_string(config.max_age_seconds);
+    
+    if (config.allow_credentials) {
+        response.headers["Access-Control-Allow-Credentials"] = "true";
+    }
+    
+    if (!config.exposed_headers.empty()) {
+        std::string exposed;
+        for (size_t i = 0; i < config.exposed_headers.size(); ++i) {
+            if (i > 0) exposed += ", ";
+            exposed += config.exposed_headers[i];
+        }
+        response.headers["Access-Control-Expose-Headers"] = exposed;
     }
 }
             

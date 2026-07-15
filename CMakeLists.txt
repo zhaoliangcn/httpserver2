@@ -24,6 +24,18 @@ endif()
 # 第三方依赖查找
 # ============================================================
 
+# --- TinyDB ---
+set(TINYDB_DIR "${CMAKE_SOURCE_DIR}/../TinyDB")
+set(TINYDB_INCLUDE_DIR "${TINYDB_DIR}/include")
+set(TINYDB_CLIENT_LIB "${TINYDB_DIR}/build/libtinydb_client.so")
+if(EXISTS "${TINYDB_CLIENT_LIB}")
+    message(STATUS "Found TinyDB at ${TINYDB_DIR}")
+    include_directories(${TINYDB_INCLUDE_DIR})
+    link_directories(${TINYDB_DIR}/build)
+else()
+    message(STATUS "TinyDB not found at ${TINYDB_DIR}, TinyDB adapter will be unavailable")
+endif()
+
 # --- Boost ---
 # 优先查找系统安装的 Boost，失败则回退到本地目录
 find_package(Boost 1.86.0 QUIET COMPONENTS system thread)
@@ -100,41 +112,119 @@ set(SERVER_SRCS
     ${LOGGER_IMPL}
     httpserver2.cpp
     main.cpp
+    auth/jwt.cpp
+    validation/validator.cpp
+    session/memory_store.cpp
+    db/sqlite_database.cpp
+    db/tinydb_database.cpp
+    ws/websocket.cpp
+    cache/memory_cache.cpp
+    stream/streaming.cpp
+    plugin/plugin_manager.cpp
+    http2/http2_handler.cpp
+    middleware/request_id.cpp
+    docs/openapi.cpp
 )
 
 set(TEST_CONCURRENT_SRCS
     ${LOGGER_IMPL}
     httpserver2.cpp
     test_concurrent.cpp
+    auth/jwt.cpp
+    validation/validator.cpp
+    session/memory_store.cpp
+    db/sqlite_database.cpp
+    db/tinydb_database.cpp
+    ws/websocket.cpp
+    cache/memory_cache.cpp
+    stream/streaming.cpp
+    plugin/plugin_manager.cpp
+    http2/http2_handler.cpp
+    middleware/request_id.cpp
+    docs/openapi.cpp
 )
 
 set(TEST_PROXY_SRCS
     ${LOGGER_IMPL}
     httpserver2.cpp
     test_proxy.cpp
+    auth/jwt.cpp
+    validation/validator.cpp
+    session/memory_store.cpp
+    db/sqlite_database.cpp
+    db/tinydb_database.cpp
+    ws/websocket.cpp
+    cache/memory_cache.cpp
+    stream/streaming.cpp
+    plugin/plugin_manager.cpp
+    http2/http2_handler.cpp
+    middleware/request_id.cpp
+    docs/openapi.cpp
 )
 
 set(TEST_STATIC_PERF_SRCS
     ${LOGGER_IMPL}
     httpserver2.cpp
     test_static_performance.cpp
+    auth/jwt.cpp
+    validation/validator.cpp
+    session/memory_store.cpp
+    db/sqlite_database.cpp
+    db/tinydb_database.cpp
+    ws/websocket.cpp
+    cache/memory_cache.cpp
+    stream/streaming.cpp
+    plugin/plugin_manager.cpp
+    http2/http2_handler.cpp
+    middleware/request_id.cpp
+    docs/openapi.cpp
 )
 
 set(TEST_REVERSE_PROXY_SRCS
     ${LOGGER_IMPL}
     httpserver2.cpp
     test_reverse_proxy_simple.cpp
+    auth/jwt.cpp
+    validation/validator.cpp
+    session/memory_store.cpp
+    db/sqlite_database.cpp
+    db/tinydb_database.cpp
+    ws/websocket.cpp
+    cache/memory_cache.cpp
+    stream/streaming.cpp
+    plugin/plugin_manager.cpp
+    http2/http2_handler.cpp
+    middleware/request_id.cpp
+    docs/openapi.cpp
 )
 
 set(TEST_UNIT_SRCS
     ${LOGGER_IMPL}
     httpserver2.cpp
     test_unit.cpp
+    auth/jwt.cpp
+    validation/validator.cpp
+    session/memory_store.cpp
+    db/sqlite_database.cpp
+    db/tinydb_database.cpp
+    ws/websocket.cpp
+    cache/memory_cache.cpp
+    stream/streaming.cpp
+    plugin/plugin_manager.cpp
+    http2/http2_handler.cpp
+    middleware/request_id.cpp
+    docs/openapi.cpp
 )
 
 set(TEST_STRESS_SRCS
     ${LOGGER_IMPL}
     test_stress.cpp
+    auth/jwt.cpp
+    validation/validator.cpp
+    session/memory_store.cpp
+    db/sqlite_database.cpp
+    db/tinydb_database.cpp
+    ws/websocket.cpp
 )
 
 # ============================================================
@@ -152,6 +242,10 @@ target_link_libraries(httpserver2
         yaml-cpp
         pthread
         z
+        sqlite3
+        dl
+        nghttp2
+        tinydb_client
 )
 
 # 并发测试
@@ -164,6 +258,10 @@ target_link_libraries(test_concurrent
         OpenSSL::Crypto
         pthread
         z
+        sqlite3
+        dl
+        nghttp2
+        tinydb_client
 )
 
 # 代理测试
@@ -176,6 +274,10 @@ target_link_libraries(test_proxy
         OpenSSL::Crypto
         pthread
         z
+        sqlite3
+        dl
+        nghttp2
+        tinydb_client
 )
 
 # 静态文件性能测试
@@ -188,6 +290,10 @@ target_link_libraries(test_static_performance
         OpenSSL::Crypto
         pthread
         z
+        sqlite3
+        dl
+        nghttp2
+        tinydb_client
 )
 
 # 反向代理简单测试
@@ -200,6 +306,10 @@ target_link_libraries(test_reverse_proxy_simple
         OpenSSL::Crypto
         pthread
         z
+        sqlite3
+        dl
+        nghttp2
+        tinydb_client
 )
 
 # 核心组件单元测试
@@ -212,6 +322,10 @@ target_link_libraries(test_unit
         OpenSSL::Crypto
         pthread
         z
+        sqlite3
+        dl
+        nghttp2
+        tinydb_client
 )
 
 # ============================================================
@@ -269,6 +383,9 @@ else()
             OpenSSL::Crypto
             pthread
             z
+            dl
+            nghttp2
+            tinydb_client
     )
 endif()
 
