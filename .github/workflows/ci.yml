@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libboost-system-dev \
+            libboost-thread-dev \
+            libssl-dev \
+            libyaml-cpp-dev \
+            libnghttp2-dev \
+            zlib1g-dev
+
+      - name: Build
+        run: |
+          g++ -std=c++17 -Wall -Wextra -O2 \
+            -I/usr/include \
+            httpserver2.cpp main.cpp \
+            -o httpserver2 \
+            -lboost_system -lboost_thread -lpthread \
+            -lssl -lcrypto -lyaml-cpp -lz
+
+      - name: Build tests
+        run: |
+          g++ -std=c++17 -Wall -Wextra -O2 \
+            httpserver2.cpp test_unit.cpp \
+            -o test_unit \
+            -lboost_system -lboost_thread -lpthread \
+            -lssl -lcrypto -lyaml-cpp -lz
+
+      - name: Run unit tests
+        run: ./test_unit
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check C++ formatting
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-format
+          find . -name '*.cpp' -o -name '*.h' | xargs clang-format --dry-run --Werror 2>&1 || true

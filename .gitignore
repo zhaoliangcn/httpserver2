@@ -44,3 +44,11 @@ Thumbs.db
 
 # 测试配置文件
 test_config_no_auth.yaml
+
+# IDE 本地配置
+.atomcode/
+
+# 测试大文件
+large_file.txt
+large_json.txt
+large_test_file.txt
