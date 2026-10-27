@@ -27,8 +27,14 @@ std::shared_ptr<Database> Database::create(const DBConfig& config) {
             return std::make_shared<SQLiteDatabase>(config);
         case DBType::POSTGRES:
             // PostgreSQL 暂未实现，使用 TinyDB 替代
+#ifdef HS2_WITH_TINYDB
             LOG_INFO("PostgreSQL not available, using TinyDB adapter");
             return std::make_shared<TinyDBDatabase>(config);
+#else
+            LOG_INFO("PostgreSQL not available, and TinyDB adapter is disabled "
+                     "(build with -DHS2_WITH_TINYDB=ON to enable it)");
+            return nullptr;
+#endif
         default:
             return nullptr;
     }

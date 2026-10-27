@@ -117,17 +117,54 @@
 
 ### 构建
 
-```bash
-# 安装依赖
-# Ubuntu/Debian:
-sudo apt-get install libboost-all-dev libssl-dev libsqlite3-dev libnghttp2-dev
+依赖查找顺序：先用 `find_package` 找系统安装，找不到再回退到本地目录。
+所有依赖路径都可用 `-D` 覆盖。
 
-# 克隆并构建
+```bash
+# Ubuntu/Debian
+sudo apt-get install libboost-dev libssl-dev libsqlite3-dev \
+                     libnghttp2-dev libyaml-cpp-dev zlib1g-dev cmake
+
 git clone <repo-url> && cd httpserver2
-mkdir build && cd build
-cmake .. -DCMAKE_BUILD_TYPE=Release
-make -j$(nproc)
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build
 ```
+
+Windows（MSVC + vcpkg）：
+
+```powershell
+vcpkg install boost-asio:x64-windows-static openssl:x64-windows-static `
+            zlib:x64-windows-static sqlite3:x64-windows-static `
+            yaml-cpp:x64-windows-static nghttp2:x64-windows-static
+
+cmake -S . -B build -A x64 `
+  -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" `
+  -DCMAKE_BUILD_TYPE=Release
+cmake --build build --config Release
+```
+
+依赖路径用变量指定（`HS2_DEPS_ROOT` 是所有依赖的公共父目录）：
+
+```bash
+cmake -S . -B build \
+  -DHS2_DEPS_ROOT=/opt/deps \
+  -DHS2_BOOST_ROOT=/opt/deps/boost_1_86_0 \
+  -DHS2_OPENSSL_ROOT=/opt/deps/openssl-3.3.1-install \
+  -DHS2_YAML_CPP_ROOT=/opt/deps/yaml-cpp \
+  -DHS2_NGHTTP2_ROOT=/opt/deps/nghttp2-install \
+  -DHS2_TINYDB_ROOT=/opt/deps/TinyDB
+```
+
+可关闭的可选模块：
+
+| 选项 | 默认 | 说明 |
+|------|------|------|
+| `HS2_BUILD_TESTS` | ON | 构建测试可执行文件 |
+| `HS2_ENABLE_HTTP2` | ON | 编译 HTTP/2 模块（需要 nghttp2） |
+| `HS2_WITH_TINYDB` | ON | 编译 TinyDB 适配器（需要 TinyDB 客户端库） |
+
+> Windows 上没有 `vcvars64.bat` 可用时（它内部调用的 `reg.exe` 被安全策略拦截），
+> 可用 `scripts/build-windows.bat` 直接调用 `cl.exe`，绕过 CMake 的编译器探测。
 
 ### 运行
 
@@ -364,14 +401,15 @@ server.enableCors(cors);
 ## 测试
 
 ```bash
-# C++ 单元测试（226 用例）
-./test_unit
+# C++ 单元测试（250 用例）
+./build/bin/test_unit
 
 # Python 集成测试
 python3 run_tests.py
 
 # 构建并运行所有测试
-cmake --build . --target test-auto
+cmake --build build --target build-tests
+ctest --test-dir build
 ```
 
 ## 性能

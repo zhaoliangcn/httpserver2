@@ -2,12 +2,13 @@ name: CI
 
 on:
   push:
-    branches: [master]
+    branches: [main, master]
   pull_request:
-    branches: [master]
+    branches: [main, master]
 
 jobs:
-  build:
+  linux:
+    name: Linux (GCC / CMake)
     runs-on: ubuntu-latest
 
     steps:
@@ -17,34 +18,79 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            libboost-system-dev \
-            libboost-thread-dev \
+            libboost-dev \
             libssl-dev \
             libyaml-cpp-dev \
             libnghttp2-dev \
-            zlib1g-dev
+            libsqlite3-dev \
+            zlib1g-dev \
+            cmake \
+            ninja-build
+
+      # 依赖查找顺序：
+      #   1) find_package 走系统安装（libssl-dev 等提供 cmake config）
+      #   2) 找不到时回退到 HS2_DEPS_ROOT 下的本地目录
+      # Ubuntu 上系统包版本可能低于 3.0，OpenSSL 单独指定根目录。
+      - name: Configure
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DHS2_DEPS_ROOT="${GITHUB_WORKSPACE}/.." \
+            -DHS2_OPENSSL_ROOT=/usr \
+            -DHS2_YAML_CPP_ROOT=/usr
 
       - name: Build
-        run: |
-          g++ -std=c++17 -Wall -Wextra -O2 \
-            -I/usr/include \
-            httpserver2.cpp main.cpp \
-            -o httpserver2 \
-            -lboost_system -lboost_thread -lpthread \
-            -lssl -lcrypto -lyaml-cpp -lz
-
-      - name: Build tests
-        run: |
-          g++ -std=c++17 -Wall -Wextra -O2 \
-            httpserver2.cpp test_unit.cpp \
-            -o test_unit \
-            -lboost_system -lboost_thread -lpthread \
-            -lssl -lcrypto -lyaml-cpp -lz
+        run: cmake --build build --target httpserver2 test_unit
 
       - name: Run unit tests
-        run: ./test_unit
+        run: ./build/bin/test_unit
+
+  windows:
+    name: Windows (MSVC / CMake)
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up MSVC
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          # vcpkg 提供 OpenSSL / zlib / sqlite3 / yaml-cpp / nghttp2 的 Windows 版
+          # 头文件与库。Boost 只用 header-only 部分，vcpkg 的 boost-asio 头即可。
+          vcpkg install boost-asio:x64-windows-static `
+            openssl:x64-windows-static `
+            zlib:x64-windows-static `
+            sqlite3:x64-windows-static `
+            yaml-cpp:x64-windows-static `
+            nghttp2:x64-windows-static
+          Write-Host "VCPKG_ROOT=$env:VCPKG_ROOT"
+
+      - name: Configure
+        shell: pwsh
+        run: |
+          # VCPKG_ROOT 指向 vcpkg 安装目录，其 installed/x64-windows 里有完整的
+          # include/ 与 lib/ 布局，CMake 的 find_package 能直接定位。
+          cmake -S . -B build -A x64 `
+            -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DHS2_BOOST_ROOT="$env:VCPKG_ROOT/installed/x64-windows/include" `
+            -DHS2_YAML_CPP_ROOT="$env:VCPKG_ROOT/installed/x64-windows" `
+            -DHS2_NGHTTP2_ROOT="$env:VCPKG_ROOT/installed/x64-windows" `
+            -DHS2_TINYDB_ROOT="$env:VCPKG_ROOT/installed/x64-windows"
+
+      - name: Build
+        shell: pwsh
+        run: cmake --build build --config Release --target httpserver2 test_unit
+
+      - name: Run unit tests
+        shell: pwsh
+        run: .\build\bin\Release\test_unit.exe
 
   lint:
+    name: Formatting
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

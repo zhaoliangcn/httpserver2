@@ -97,6 +97,11 @@ public:
 };
 
 // TinyDB 实现
+//
+// 只在启用 TinyDB 适配器时编译（CMake 选项 HS2_WITH_TINYDB，默认为 ON）。
+// 关闭后 TinyDBDatabase 类不声明、Database::create 的 POSTGRES 分支也不再
+// 引用它，从而不需要链接 TinyDB 客户端库。
+#ifdef HS2_WITH_TINYDB
 class TinyDBDatabase : public Database {
 private:
     void* client_ = nullptr;  // TinyDBClient* (opaque pointer)
@@ -133,6 +138,7 @@ public:
     bool describeTable(const std::string& table_name, std::string& json, std::string& error);
     bool listIndexes(const std::string& table_name, std::string& json, std::string& error);
 };
+#endif // HS2_WITH_TINYDB
 
 }} // namespace http2::db
 

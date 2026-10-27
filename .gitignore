@@ -1,6 +1,9 @@
 # 构建产物
 build/
 build-win/
+build-cmake/
+build-notinydb/
+out/
 *.o
 *.obj
 *.exe
