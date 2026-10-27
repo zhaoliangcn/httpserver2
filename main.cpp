@@ -9,7 +9,10 @@
 #include <fstream>
 #include <string>
 // 使用 yaml-cpp 库解析 YAML 配置文件
-#include "../thirdparty/yaml-cpp/include/yaml-cpp/yaml.h"
+// 走 CMakeLists 里已经设置的 YAML_CPP_INCLUDE_DIR，不再硬编码兄弟目录路径
+// （原写法 ../thirdparty/yaml-cpp/include/... 只在特定的目录布局下成立，
+//   换机器或换平台就会找不到头文件）。
+#include <yaml-cpp/yaml.h>
 
 // 简单的YAML解析辅助函数
 struct Config {

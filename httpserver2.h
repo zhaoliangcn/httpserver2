@@ -38,6 +38,11 @@ namespace http2 { namespace ws {
 }}
 
 // 日志级别枚举（与外部 logger 库对接）
+// Windows SDK 的 wingdi.h 里定义了 `#define ERROR 0`，不取消定义的话
+// `ERROR = 4` 会被展开成 `0 = 4`。
+#ifdef ERROR
+#undef ERROR
+#endif
 enum class LogLevel {
     DEBUG = 1,
     INFO  = 2,

@@ -52,7 +52,20 @@ TinyDBDatabase::~TinyDBDatabase() {
 bool TinyDBDatabase::connect() {
     if (client_) return true;
     
-    TinyDBConnectOptions options = TINYDB_DEFAULT_OPTIONS;
+    // 不用 TINYDB_DEFAULT_OPTIONS 宏：它内部是 C++20 的指定初始化器
+    // （.host = ... 形式），在 C++17 下 GCC 只是当扩展放行，MSVC 会直接拒绝
+    // （error C7555）。这里逐字段赋值，语义与宏完全一致，只依赖 C++17。
+    TinyDBConnectOptions options{};
+    options.host = "127.0.0.1";
+    options.port = 5432;
+    options.user = "";
+    options.password = "";
+    options.database = "";
+    options.timeout_ms = 30000;
+    options.use_ssl = false;
+    options.ssl_cert = nullptr;
+    options.ssl_key = nullptr;
+
     options.host = host_.c_str();
     options.port = port_;
     options.timeout_ms = config_.timeout_seconds * 1000;
