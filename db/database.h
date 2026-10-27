@@ -47,7 +47,11 @@ struct QueryResult {
 };
 
 // 数据库抽象接口
-class Database {
+//
+// 继承 enable_shared_from_this：executeTransaction 的回调需要一个
+// shared_ptr<Database> 才能在事务里继续执行语句，而基类方法内拿不到自身的
+// shared_ptr（那是调用方持有的）。没有这个继承，该便捷方法无法实现。
+class Database : public std::enable_shared_from_this<Database> {
 public:
     static std::shared_ptr<Database> create(const DBConfig& config);
     

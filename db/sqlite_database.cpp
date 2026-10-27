@@ -44,13 +44,36 @@ std::shared_ptr<Database> Database::create(const DBConfig& config) {
 // 事务便捷方法
 // ============================================================
 bool Database::executeTransaction(const std::function<bool(std::shared_ptr<Database>)>& callback) {
-    // 注意：此方法需要 Database 继承 enable_shared_from_this
-    // 简化实现：直接调用 beginTransaction/commit/rollback
-    // 子类应重写此方法
+    // 事务语义：回调返回 true 则提交，返回 false（或抛异常）则回滚。
+    //
+    // 原实现开启事务后既不调用回调也不提交，直接 return false —— 事务永远
+    // 挂着不结束，数据库连接被卡在事务态，后续写入行为不可预期。
+    if (!callback) return false;
+
+    // shared_from_this() 在对象未被 shared_ptr 持有时抛 bad_weak_ptr。
+    // 直接栈上构造数据库再调这个方法是合法用法，不该因此炸掉：
+    // 这种情况下没有可传给回调的共享指针，只能按失败处理。
+    std::shared_ptr<Database> self;
+    try {
+        self = shared_from_this();
+    } catch (const std::bad_weak_ptr&) {
+        LOG_ERROR("executeTransaction requires the Database to be held by a shared_ptr");
+        return false;
+    }
+
     if (!beginTransaction()) return false;
-    // 无法直接获取 shared_from_this，这里简化处理
-    // 实际使用中请直接调用 beginTransaction/commit/rollback
-    return false;
+
+    try {
+        if (!callback(self)) {
+            rollback();
+            return false;
+        }
+    } catch (...) {
+        rollback();
+        throw;
+    }
+
+    return commit();
 }
 
 // ============================================================

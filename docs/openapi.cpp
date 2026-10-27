@@ -151,7 +151,7 @@ std::string OpenApiDoc::toHtml() const {
     return ss.str();
 }
 
-void OpenApiDoc::generateFromRoutes(HttpServer2* server) {
+void OpenApiDoc::generateFromRoutes(HttpServer2* /*server*/) {
     // 简化版：从服务器注册的路由生成文档
     // 实际实现需要服务器提供路由列表的访问接口
     LOG_INFO("OpenAPI doc generated from registered routes");

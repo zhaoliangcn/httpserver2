@@ -346,7 +346,32 @@ private:
 
 /* -----------------------------------------------------------------------
  * C++ Convenience Macros
+ *
+ * The C macros above are also visible in C++ mode (they live inside the
+ * extern "C" block, which only closes further down). Redefining them here
+ * without an #undef first triggers "macro redefinition" warnings
+ * (MSVC C4005 / GCC -Wmacro-redefined) in every translation unit that
+ * defines LOGGER_IMPLEMENTATION.
  * ----------------------------------------------------------------------- */
+#ifdef LOG_TRACE
+#  undef LOG_TRACE
+#endif
+#ifdef LOG_DEBUG
+#  undef LOG_DEBUG
+#endif
+#ifdef LOG_INFO
+#  undef LOG_INFO
+#endif
+#ifdef LOG_WARN
+#  undef LOG_WARN
+#endif
+#ifdef LOG_ERROR
+#  undef LOG_ERROR
+#endif
+#ifdef LOG_FATAL
+#  undef LOG_FATAL
+#endif
+
 #if LOGGER_ENABLE
 
 #  define LOG_TRACE(fmt, ...) \

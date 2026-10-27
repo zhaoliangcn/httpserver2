@@ -9,6 +9,8 @@
 #include "httpserver2.h"
 #include <iostream>
 #include <sstream>
+#include <memory>
+#include <stdexcept>
 #include <zlib.h>
 #include "auth/jwt.h"
 #include "validation/validator.h"
@@ -726,7 +728,53 @@ static void test_database() {
     db->rollback();
     auto r7 = db->execute("SELECT COUNT(*) FROM test");
     TEST("Database rollback", r7.value() == "3");
-    
+
+    // executeTransaction 便捷方法
+    // 回归点：原实现开启事务后既不调用回调也不提交，直接返回 false，
+    // 事务永远挂着不结束。这里的断言同时验证「回调被调用」与「提交生效」。
+    {
+        bool callback_called = false;
+        bool ok = db->executeTransaction([&](std::shared_ptr<http2::db::Database> self) -> bool {
+            callback_called = true;
+            TEST("executeTransaction 回调拿到有效连接", self != nullptr);
+            self->execute("INSERT INTO test (name, age) VALUES (?, ?)", {"Eve", "45"});
+            return true;
+        });
+        TEST("executeTransaction 回调被调用", callback_called);
+        TEST("executeTransaction 成功提交", ok);
+
+        auto r8 = db->execute("SELECT COUNT(*) FROM test");
+        TEST("executeTransaction 提交后数据可见", r8.value() == "4");
+    }
+
+    // 回调返回 false 时应回滚，不留下痕迹
+    {
+        bool ok = db->executeTransaction([](std::shared_ptr<http2::db::Database> self) -> bool {
+            self->execute("INSERT INTO test (name, age) VALUES (?, ?)", {"Frank", "50"});
+            return false;
+        });
+        TEST("executeTransaction 回调返回 false 时不提交", !ok);
+
+        auto r9 = db->execute("SELECT COUNT(*) FROM test");
+        TEST("executeTransaction 回滚后数据未生效", r9.value() == "4");
+    }
+
+    // 回调抛异常时应回滚并向上传播
+    {
+        bool threw = false;
+        try {
+            db->executeTransaction([](std::shared_ptr<http2::db::Database>) -> bool {
+                throw std::runtime_error("boom");
+            });
+        } catch (const std::exception&) {
+            threw = true;
+        }
+        TEST("executeTransaction 回调异常时向上传播", threw);
+
+        auto r10 = db->execute("SELECT COUNT(*) FROM test");
+        TEST("executeTransaction 异常后事务已回滚", r10.value() == "4");
+    }
+
     db->disconnect();
     TEST("Database disconnect", !db->isConnected());
 }

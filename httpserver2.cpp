@@ -20,6 +20,7 @@
 #include <string>
 #include <mutex>
 #include <charconv>
+#include <system_error>
 #include <ctime>
 #include <cstdio>
 #include <cstdint>
@@ -135,8 +136,9 @@ std::string gzipCompress(const std::string& data) {
     }
     
     // 设置输入数据
+    // 上面的 4GB 检查已保证窄化安全，这里显式 cast 让意图明确（否则 MSVC 报 C4267）
     zs.next_in = (Bytef*)data.data();
-    zs.avail_in = data.size();
+    zs.avail_in = static_cast<uInt>(data.size());
     
     // 输出缓冲区
     std::string compressed;
@@ -145,7 +147,7 @@ std::string gzipCompress(const std::string& data) {
     // 压缩数据
     do {
         zs.next_out = (Bytef*)buffer.data();
-        zs.avail_out = buffer.size();
+        zs.avail_out = static_cast<uInt>(buffer.size());
         
         // 执行压缩
         int ret = deflate(&zs, Z_FINISH);
@@ -943,7 +945,8 @@ uint64_t PerformanceMonitor::getBytesReceived() {
 // 获取每秒请求数
 double PerformanceMonitor::getRequestsPerSecond() {
     auto now = std::chrono::steady_clock::now();
-    double elapsed_seconds = std::chrono::duration_cast<std::chrono::seconds>(now - start_time_).count();
+    double elapsed_seconds = std::chrono::duration_cast<std::chrono::duration<double>>(
+                                 now - start_time_).count();
     if (elapsed_seconds == 0) return 0.0;
     return static_cast<double>(total_requests_) / elapsed_seconds;
 }
@@ -1221,8 +1224,12 @@ bool RegexRouteMatcher::match(const std::string& path, std::unordered_map<std::s
         boost::smatch matches;
         if (boost::regex_match(path, matches, regex_)) {
             // 提取捕获组作为路径参数，使用捕获组索引作为键
-            for (size_t i = 1; i < matches.size(); i++) {
-                path_params[std::to_string(i)] = matches[i].str();
+            // matches.size() 返回 boost::smatch::size_type（有符号），用同样的
+            // 类型遍历，避免 size_t / ptrdiff_t 混比产生的告警与潜在下溢。
+            // boost::smatch::size_type 是 ptrdiff_t（有符号），std::to_string
+            // 没有对应的重载，转换到 long long 才是无歧义的。
+            for (boost::smatch::size_type i = 1; i < matches.size(); i++) {
+                path_params[std::to_string(static_cast<long long>(i))] = matches[i].str();
             }
             return true;
         }
@@ -1324,7 +1331,16 @@ void HttpServer2::start(int port, size_t thread_pool_size) {
     try {
         // 允许 stop() 后重新 start()
         stopped_.store(false);
-        
+
+        // 端口合法性检查。
+        // tcp::endpoint 的端口类型是 uint16_t，直接把 int 传进去会静默截断：
+        // start(70000) 会变成 4464，start(-1) 会变成 65535 —— 监听的端口与
+        // 调用方以为的完全不符，且没有任何提示。这里提前拦下。
+        if (port <= 0 || port > 65535) {
+            throw std::invalid_argument(
+                "Invalid port " + std::to_string(port) + ": must be in range 1-65535");
+        }
+
         // 确定线程池大小，如果为0则使用CPU核心数
         if (thread_pool_size == 0) {
             thread_pool_size = std::thread::hardware_concurrency();
@@ -1339,9 +1355,12 @@ void HttpServer2::start(int port, size_t thread_pool_size) {
 
         // 选择第一个io_context来创建acceptor
         auto main_io_context = io_contexts_[0];
-        
+
         // 创建acceptor
-        acceptor_ = std::make_unique<tcp::acceptor>(*main_io_context, tcp::endpoint(tcp::v4(), port));
+        // 端口类型是 net::ip::port_type（uint_least16_t），不是 tcp::port_type
+        acceptor_ = std::make_unique<tcp::acceptor>(
+            *main_io_context,
+            tcp::endpoint(tcp::v4(), static_cast<net::ip::port_type>(port)));
         
         // 设置服务器运行状态
         running_ = true;
@@ -1382,7 +1401,9 @@ void HttpServer2::start(int port, size_t thread_pool_size) {
         // 启动配置文件监控线程
         startConfigWatch();
         
-        std::cout << "HTTP Server (supporting HTTP/1.1 and HTTP/2.0) started on port " << port 
+        // 注意：这里只对外提供 HTTP/1.1。HTTP/2 模块已编译进库但 acceptor 未接入，
+        // 打印 HTTP/2 会让使用者以为可以用 ALPN / h2 访问。
+        std::cout << "HTTP Server (HTTP/1.1) started on port " << port
                   << " with " << thread_pool_size << " worker threads" << std::endl;
         std::cout << "Server is running at " << (use_ssl_ ? "https" : "http") << "://localhost:" << port << std::endl;
         if (enable_adaptive_thread_pool_) {
@@ -3195,12 +3216,27 @@ UrlParts parseUrl(const std::string& url) {
     }
     
     // 提取端口号
+    //
+    // 不能直接用 std::stoi：一是它对非数字字符串抛 std::invalid_argument，
+    // 而 parseUrl 没有异常契约，会把异常抛到调用方；二是 port 是 uint16_t，
+    // 赋 70000 这类越界值会被静默截断成 4464，请求打到意外端口。
+    // 这里用 from_chars 严格解析，越界或非法一律按默认端口处理。
     size_t port_start = parts.host.find(":");
     if (port_start != std::string::npos) {
-        parts.port = std::stoi(parts.host.substr(port_start + 1));
+        const std::string port_str = parts.host.substr(port_start + 1);
+        unsigned long parsed_port = 0;
+        const char* begin = port_str.data();
+        const char* end = begin + port_str.size();
+        const auto result = std::from_chars(begin, end, parsed_port);
+        if (result.ec == std::errc() && result.ptr == end &&
+            parsed_port > 0 && parsed_port <= 65535) {
+            parts.port = static_cast<uint16_t>(parsed_port);
+        } else {
+            LOG_WARNING("Invalid port in URL: '" + port_str + "', using default port");
+        }
         parts.host = parts.host.substr(0, port_start);
     }
-    
+
     return parts;
 }
 
@@ -4125,8 +4161,9 @@ std::string HttpServer2::base64Decode(const std::string& encoded) {
         
         size_t idx = base64_chars.find(c);
         if (idx == std::string::npos) continue;
-        
-        val = (val << 6) + idx;
+
+        // idx 最多 63，落在 int 范围内；显式转换消除窄化告警
+        val = (val << 6) + static_cast<int>(idx);
         valb += 6;
         
         if (valb >= 0) {
@@ -4140,19 +4177,35 @@ std::string HttpServer2::base64Decode(const std::string& encoded) {
 
 // SHA-256哈希计算函数
 std::string HttpServer2::calculateSha256(const std::string& input) {
-    // 简化实现，实际生产环境应使用更安全的密码哈希方法
-    unsigned char hash[SHA256_DIGEST_LENGTH];
-    SHA256_CTX sha256;
-    SHA256_Init(&sha256);
-    SHA256_Update(&sha256, input.c_str(), input.size());
-    SHA256_Final(hash, &sha256);
-    
-    std::stringstream ss;
-    for (int i = 0; i < SHA256_DIGEST_LENGTH; i++) {
-        ss << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(hash[i]);
+    // 用 EVP 而非已废弃的 SHA256_Init/Update/Final：
+    // OpenSSL 3.0 起那组低阶 API 被标记 deprecated，未来版本会移除。
+    //
+    // 注意：这不是用于口令存储的口令哈希（口令另有 PBKDF2 路径），
+    // 这里只用于 ETag 等非机密场景的内容摘要。
+    unsigned char hash[EVP_MAX_MD_SIZE];
+    unsigned int hash_len = 0;
+
+    EVP_MD_CTX* ctx = EVP_MD_CTX_new();
+    if (!ctx) {
+        LOG_ERROR("calculateSha256: EVP_MD_CTX_new failed");
+        return std::string();
     }
-    
-    return ss.str();
+
+    std::string result;
+    if (EVP_DigestInit_ex(ctx, EVP_sha256(), nullptr) != 1 ||
+        EVP_DigestUpdate(ctx, input.data(), input.size()) != 1 ||
+        EVP_DigestFinal_ex(ctx, hash, &hash_len) != 1) {
+        LOG_ERROR("calculateSha256: digest computation failed");
+    } else {
+        std::stringstream ss;
+        for (unsigned int i = 0; i < hash_len; i++) {
+            ss << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(hash[i]);
+        }
+        result = ss.str();
+    }
+
+    EVP_MD_CTX_free(ctx);
+    return result;
 }
 
 // CSRF保护功能实现

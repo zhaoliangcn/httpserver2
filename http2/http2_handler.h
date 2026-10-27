@@ -23,24 +23,27 @@ namespace http2 { namespace http2_support {
 class Http2Session {
 private:
     nghttp2_session* session_ = nullptr;
-    std::function<int(const uint8_t*, size_t)> send_callback_;
+    // 用 ssize_t 而非 int：nghttp2 的 send callback 约定返回写入字节数，
+    // 负值表示错误（NGHTTP2_ERR_CALLBACK_FAILURE）。用 int 会在返回值
+    // 超过 2GB 时溢出，且负值语义与 nghttp2 的约定对不上。
+    std::function<ssize_t(const uint8_t*, size_t)> send_callback_;
     bool initialized_ = false;
 
 public:
     Http2Session() = default;
     ~Http2Session();
-    
+
     // 初始化 HTTP/2 会话（服务器端）
     bool initServer();
-    
+
     // 处理接收到的数据
     int processData(const uint8_t* data, size_t length);
-    
+
     // 发送数据（由回调调用）
-    int sendData(const uint8_t* data, size_t length);
-    
+    ssize_t sendData(const uint8_t* data, size_t length);
+
     // 发送数据回调
-    void setSendCallback(std::function<int(const uint8_t*, size_t)> cb) {
+    void setSendCallback(std::function<ssize_t(const uint8_t*, size_t)> cb) {
         send_callback_ = std::move(cb);
     }
     

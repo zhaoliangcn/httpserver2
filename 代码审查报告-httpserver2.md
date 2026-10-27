@@ -3,7 +3,90 @@
 - **审查对象**：`httpserver2.h`（673 行）、`httpserver2.cpp`（3930 行），及被引用的 `auth/`、`validation/`、`session/`、`cache/`、`ws/`、`middleware/` 模块
 - **对照文档**：`README.md`（v2.5）、`HttpServer2_API文档.md`
 - **审查日期**：2026-10-27
-- **审查方式**：静态审阅 + 跨模块调用链核对（未编译，环境无 C++ 工具链与 Boost 依赖）
+- **审查方式**：静态审阅 + 跨模块调用链核对
+- **状态**：**已修复**（2026-10-27）。审查结论全部落地，并已在 Windows + VS2022 + Boost 1.86 下完成编译、链接、单元测试与真实 HTTP 请求验证。下文第二节至第六节保留修复前的原始分析正文，作为问题成因的记录。
+
+---
+
+## 〇、修复状态总览
+
+### P0 阻断级
+
+| 编号 | 问题 | 状态 | 处理方式 |
+|---|---|---|---|
+| P0-1 | 中间件契约与全部内置中间件自相矛盾 | ✅ 已修 | `Middleware` 改为 `std::function<std::optional<HttpResponse>(HttpRequest&)>`：`nullopt` 放行、响应即中断。`jwt` / `session` / `cache` / `validator` / `request_id` 五个内置中间件全部重写；中间件抛异常时 fail-closed 返回 500（原实现下一个抛异常的鉴权中间件就是后门）。参数改为可变引用，中间件才能把 claims 写回请求 |
+| P0-2 | `client_socket` 从未赋值 | ✅ 已修 | 在 `if constexpr (std::is_same_v<StreamType, tcp::socket>)` 分支内赋值。TLS 下不暴露底层 socket，代理走缓冲路径 |
+| P0-3 | 代理响应被二次 gzip | ✅ 已修 | 增加 `already_encoded` / 可压缩 MIME 白名单 / 排除 206 与 304 三重判断，压缩分支必设 `Vary: Accept-Encoding` |
+| P0-4 | JWT 空密钥可伪造 token | ✅ 已修 | `sign` / `verify` 空 secret 直接拒绝；只支持 HS256 并校验 header 的 `alg`；签名比较改 `CRYPTO_memcmp` |
+| P0-5 | `active_connections_` 泄漏与下溢 | ✅ 已修 | 四处根因（sendfile 早退不回调、非 keep-alive 回调不触发、keep-alive 双重递减、WS 升级未减）统一收敛到单一 `on_complete`，无条件回调、先减后重入 |
+| P0-6 | 代理流式转发实现错误 | ✅ 已修 | 逐跳头过滤（请求/响应/流式三处）+ `keep_alive(false)` + 转发 `header_buf` 残留字节（原实现会截断响应体）。新增 `setProxyStreaming()` 开关，默认关闭（该路径仍是同步阻塞写） |
+| P0-7 | 同步阻塞 I/O 跑在 io_context 线程上 | ❌ **未修** | 架构级重构，超出本次修复范围。已在 API 文档与 README 中标注现状 |
+| P0-8 | `start()` 失败路径导致 `std::terminate` | ✅ 已修 | catch 中只调 `stop()` 并 rethrow；`stop()` 靠 `stopped_.exchange(true)` 保证幂等 |
+
+### P1 正确性（15 项全部已修）
+
+限流数据竞争与整除推导错误、`setRateLimit` 重载二义、多值 `Set-Cookie` 覆盖、`json_body` 永不填充、请求版本号拼错、Range 解析异常与 OOM、Windows 路径前缀比较失效、`gmtime`/`localtime` 非线程安全、日志字段注入、访问日志仅 debug 模式产出、handler 被二次调用绕过中间件、Host 污染 `path_params`、Basic Auth 明文比哈希、CSRF/盐/WS 会话 ID 用 MT19937、正则路由花括号语义错误、`serveStatic` catch 分支 fail-open。
+
+### P2 部分处理
+
+| 编号 | 项 | 状态 |
+|---|---|---|
+| P2-2 | 正则路由语义与文档不符 | ✅ 花括号语义已修（`{id}` → `([^/]+)`，`{[0-9]+}` → `([0-9]+)`） |
+| P2-3 | `RegexRouteMatcher::match` 异常路径每次重编译正则 | ✅ 已修，编译移出热路径 |
+| P2-5 | 缓存键不含 `Authorization` / `Vary` | ✅ 已修，键加入两者的哈希指纹 |
+| P2-6 | `gzipCompress` 对 >4GB 截断且不看 Content-Type | ✅ 已修 |
+| P2-7 | 口令哈希为单轮 SHA-256 | ✅ 已改为 PBKDF2-HMAC-SHA256 十万轮 + CSPRNG 盐 + 恒定时间比较 |
+| P2-8 | 随机数非 CSPRNG | ✅ 全部改用 OpenSSL `RAND_bytes` |
+| P2-9 | URL 解码缺失 | ✅ 已修 |
+| P2-12 | `access.log` 每请求 open/close | ✅ 已修为常驻句柄 + 互斥保护 |
+| P2-15 | 测试数量与文档不符 | ✅ 已统一为实际的 250 |
+| P2-1 | 路由查找 O(n) 线性扫描 | ❌ 未修（性能优化，非缺陷） |
+| P2-4 | `serveStatic("/")` 吞掉后续 GET 路由 | ❌ 未修（路由顺序为隐式契约，已在文档标注） |
+| P2-10 | 无路由级中间件 API | ❌ 未修（功能缺失，非缺陷） |
+| P2-11 | `parseMultipartFormData` 参数名颠倒 | ❌ 未修 |
+| P2-13 | 大量死代码 | ❌ 未修（`connection_pool_` / `reloadConfig` / 自适应线程池为空转，已在文档标注） |
+| P2-14 | `HttpRequest` 手写 move 语义 | ❌ 未修 |
+
+### 另修的平台可移植性缺陷
+
+审查时环境无工具链，未能发现；后续在 Windows + MSVC 下实测暴露：
+
+- **Windows SDK 的 `ERROR` 宏污染枚举**：`wingdi.h` 的 `#define ERROR 0` 把 `enum class Level { ERROR = 4 }` 展开成 `0 = 4`，产生一片指向无关位置的语法错误。两处枚举前加 `#undef ERROR`。
+- **TinyDB 宏使用 C++20 指定初始化器**：`TINYDB_DEFAULT_OPTIONS` 展开后是 designated initializers，项目标准 C++17，MSVC 报 C7555。改为逐字段赋值。
+- **`main.cpp` 硬编码兄弟目录**：`../thirdparty/yaml-cpp/include/...` 改为 `<yaml-cpp/yaml.h>`。
+- **`plugin_manager.cpp` 依赖 POSIX `<dlfcn.h>`**：加 `_WIN32` 下的 POSIX 兼容垫片，两平台共用同一套调用形式。
+- **nghttp2 在 Windows 下缺 `ssize_t`**：include 前用 UCRT 的 `SSIZE_T` 补别名。
+- **`async_read` 回调漏捕获 `client_ip`**：真 bug，由本次修复引入，`/Zs` 语法检查查不出，靠完整编译（`/c`）才暴露。
+- **`CMakeLists.txt` 是 Linux 专用**：整份重写为跨平台版本，CI 改走 CMake 并补 Windows 任务。
+- **`logger.h` 在声明段与实现段重复定义 `LOG_*` 宏**：加 `#undef` 消除 C4005。
+- **`single_include/logger.h#L668`**：某次 `sed -i` 误创建的残片文件，无人引用，已删除。
+
+### 编译器告警暴露的缺陷（静态审查未覆盖）
+
+完整编译（`/c`，非 `/Zs`）开启 MSVC 全部警告后，暴露出一批静态审阅无法发现、却真实存在的缺陷：
+
+| 编号 | 问题 | 状态 | 处理方式 |
+|---|---|---|---|
+| W-1 | `parseUrl` 端口静默截断：`port` 是 `uint16_t`，`std::stoi` 直接赋值 → `70000` 变 `4464`；且非数字串会抛 `std::invalid_argument`（该函数无异常契约，会令代理路径崩溃） | ✅ 已修 | 改用 `std::from_chars` 严格解析，非法端口返回错误 |
+| W-2 | `start(int port)` 端口越界静默截断：`tcp::port_type` 是 `uint16_t`，`start(70000)` 会监听 4464 | ✅ 已修 | 进入 `acceptor` 构造前校验 `1..65535`，越界抛 `std::invalid_argument`（被 `start` 的 catch 捕获并 rethrow，符合 P0-8 的失败路径） |
+| W-3 | `Database::executeTransaction` 开启事务后既不调用回调、也不提交/回滚，直接 `return false` → 事务永久挂着（真 bug） | ✅ 已修 | 实现完整语义：回调返回 true 提交、false 或异常回滚；基类 `Database` 改继承 `enable_shared_from_this`；对栈上构造的对象捕获 `bad_weak_ptr` 安全返回 false。`test_unit.cpp` 新增对应用例 |
+| W-4 | `calculateSha256` 使用 OpenSSL 3.0 已废弃的 `SHA256_Init/Update/Final`（未来版本会移除） | ✅ 已修 | 改用 EVP API（`EVP_DigestInit_ex` 等），失败返回空串；既有单测（64 位十六进制、已知向量）继续验证正确性 |
+| W-5 | `logger.h` `LOG_*` 宏在声明段与实现段各定义一遍 → 定义 `LOGGER_IMPLEMENTATION` 的编译单元触发 C4005 | ✅ 已修 | 实现段前 `#undef` 同名宏 |
+| W-6 | `main.cpp` 两处 `catch (...& e)` 的 `e` 未使用（配置解析失败原因丢失） | ✅ 已修 | 把 `e.what()` 写入 `LOG_WARNING` |
+| W-7 | 一批未使用参数 / 隐式窄化转换告警（`size_t→uInt`、`_Rep→double`、`size_t→int`、lambda 未用 `request`、`http2` 回调未用形参、`gzip` 赋值窄化） | ✅ 已修 | 加显式 cast 或改用匹配类型；回调未用形参去掉形参名（保留类型维持续约）；`getRequestsPerSecond` 改用 `duration<double>` |
+| W-8 | `http2/http2_handler.cpp` `sendData` 返回 `int` 但 nghttp2 send 回调契约为 `ssize_t`（负值表示错误） | ✅ 已修 | `Http2Session::sendData` 与 `setSendCallback` 签名统一改为 `ssize_t` |
+| W-9 | 死代码：`docs/openapi.cpp` 的 `generateFromRoutes` / `registerApiDocs` 为空实现且无人调用 | ⚠️ 标注 | 保留未用形参标注，在 P2-10 已记录为功能缺失项 |
+
+### 验证结果
+
+Windows + VS2022(BuildTools 14.44) + CMake 3.31.3 + Boost 1.86 + OpenSSL 3.3.1：
+
+- 21 个编译单元 `/Zs` 语法检查零错误
+- 完整编译链接 `httpserver2.exe` / `test_unit.exe`：**零错误、零警告、零链接告警**（MSVC 全部警告开启）
+- `test_unit.exe`：**258 用例全部通过**（250 原用例 + 本轮新增的 `executeTransaction` 等用例）
+- 真实 HTTP 请求：`/health` 返回 200 且安全头齐全；`/metrics` 带 `Accept-Encoding: gzip` 返回 `Content-Encoding: gzip` 与 `Vary: Accept-Encoding`；404 路径安全头同样齐全；`/static/` 返回 200
+- `-DHS2_WITH_TINYDB=OFF` 的配置与构建同样通过
+- 端口校验验证：`start(70000)` 因越界被拒，不会静默监听错误端口
 
 ---
 

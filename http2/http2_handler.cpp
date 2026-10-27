@@ -21,39 +21,39 @@ namespace http2 { namespace http2_support {
 // ============================================================
 // nghttp2 回调函数
 // ============================================================
-static ssize_t s_send_callback(nghttp2_session* session,
+static ssize_t s_send_callback(nghttp2_session* /*session*/,
                                const uint8_t* data, size_t length,
-                               int flags, void* user_data) {
+                               int /*flags*/, void* user_data) {
     auto* handler = static_cast<Http2Session*>(user_data);
     return handler->sendData(data, length);
 }
 
-static int s_on_header_callback(nghttp2_session* session,
-                                const nghttp2_frame* frame,
-                                const uint8_t* name, size_t namelen,
-                                const uint8_t* value, size_t valuelen,
-                                uint8_t flags,
-                                void* user_data) {
+static int s_on_header_callback(nghttp2_session* /*session*/,
+                                const nghttp2_frame* /*frame*/,
+                                const uint8_t* /*name*/, size_t /*namelen*/,
+                                const uint8_t* /*value*/, size_t /*valuelen*/,
+                                uint8_t /*flags*/,
+                                void* /*user_data*/) {
     return 0;
 }
 
-static int s_on_frame_recv_callback(nghttp2_session* session,
-                                    const nghttp2_frame* frame,
-                                    void* user_data) {
+static int s_on_frame_recv_callback(nghttp2_session* /*session*/,
+                                    const nghttp2_frame* /*frame*/,
+                                    void* /*user_data*/) {
     return 0;
 }
 
-static int s_on_data_chunk_recv_callback(nghttp2_session* session,
-                                         uint8_t flags, int32_t stream_id,
-                                         const uint8_t* data, size_t len,
-                                         void* user_data) {
+static int s_on_data_chunk_recv_callback(nghttp2_session* /*session*/,
+                                         uint8_t /*flags*/, int32_t /*stream_id*/,
+                                         const uint8_t* /*data*/, size_t /*len*/,
+                                         void* /*user_data*/) {
     return 0;
 }
 
-static int s_on_stream_close_callback(nghttp2_session* session,
-                                      int32_t stream_id,
-                                      uint32_t error_code,
-                                      void* user_data) {
+static int s_on_stream_close_callback(nghttp2_session* /*session*/,
+                                      int32_t /*stream_id*/,
+                                      uint32_t /*error_code*/,
+                                      void* /*user_data*/) {
     return 0;
 }
 
@@ -100,7 +100,7 @@ bool Http2Session::initServer() {
     return true;
 }
 
-int Http2Session::sendData(const uint8_t* data, size_t length) {
+ssize_t Http2Session::sendData(const uint8_t* data, size_t length) {
     if (send_callback_) {
         return send_callback_(data, length);
     }

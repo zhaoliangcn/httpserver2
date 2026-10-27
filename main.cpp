@@ -46,7 +46,7 @@ Config parseConfigFile(const std::string& config_path) {
             try {
                 config.max_request_size = root["max_request_size"].as<size_t>();
             } catch (const std::exception& e) {
-                LOG_WARNING("无效的max_request_size值，使用默认值");
+                LOG_WARNING("无效的max_request_size值: " + std::string(e.what()) + "，使用默认值");
             }
         }
         
@@ -68,7 +68,7 @@ Config parseConfigFile(const std::string& config_path) {
         
         LOG_INFO("成功解析配置文件: " + config_path);
     } catch (const YAML::BadFile& e) {
-        LOG_WARNING("无法打开配置文件: " + config_path + "，使用默认配置");
+        LOG_WARNING("无法打开配置文件: " + config_path + " (" + std::string(e.what()) + ")，使用默认配置");
     } catch (const YAML::Exception& e) {
         LOG_ERROR("解析配置文件时出错: " + std::string(e.what()) + "，使用默认配置");
     } catch (const std::exception& e) {
@@ -284,12 +284,12 @@ int main(int argc, char* argv[]) {
         });
 
         // 添加示例路由 - 主页
-        server.get("/", [](const HttpRequest& request) -> HttpResponse {
+        server.get("/", [](const HttpRequest&) -> HttpResponse {
             HttpResponse response;
             response.status_code = "200";
             response.status_message = "OK";
             response.headers["Content-Type"] = "application/json";
-            response.body = "{\"message\": \"Hello, HTTP/2.0 Server!\", \"version\": \"2.0\", \"features\": [\"路径参数\", \"正则路由\", \"HTTP方法区分\", \"中间件机制\"]}";
+            response.body = "{\"message\": \"Hello, HttpServer2!\", \"version\": \"2.6\", \"features\": [\"路径参数\", \"正则路由\", \"HTTP方法区分\", \"中间件机制\"]}";
             return response;
         });
 
@@ -398,7 +398,7 @@ int main(int argc, char* argv[]) {
     });
     
     // 添加性能监控路由 - 返回Prometheus格式指标
-    server.get("/metrics", [&server](const HttpRequest& request) {
+    server.get("/metrics", [&server](const HttpRequest&) {
         HttpResponse response;
         response.status_code = "200";
         response.status_message = "OK";
@@ -408,7 +408,7 @@ int main(int argc, char* argv[]) {
     });
     
     // 添加传统性能报告路由
-    server.get("/performance", [&server](const HttpRequest& request) {
+    server.get("/performance", [&server](const HttpRequest&) {
         HttpResponse response;
         response.status_code = "200";
         response.status_message = "OK";
@@ -418,7 +418,7 @@ int main(int argc, char* argv[]) {
     });
     
     // 添加健康检查API
-    server.get("/health", [](const HttpRequest& request) {
+    server.get("/health", [](const HttpRequest&) {
         HttpResponse response;
         response.status_code = "200";
         response.status_message = "OK";
