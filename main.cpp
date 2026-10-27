@@ -8,11 +8,11 @@
 #include <chrono>
 #include <fstream>
 #include <string>
-// 使用 yaml-cpp 库解析 YAML 配置文件
-// 走 CMakeLists 里已经设置的 YAML_CPP_INCLUDE_DIR，不再硬编码兄弟目录路径
+// 使用 PipeYAML 库解析 YAML 配置文件
+// 走 CMakeLists 里已经设置的 PIPEYAML_INCLUDE_DIR，不再硬编码兄弟目录路径
 // （原写法 ../thirdparty/yaml-cpp/include/... 只在特定的目录布局下成立，
 //   换机器或换平台就会找不到头文件）。
-#include <yaml-cpp/yaml.h>
+#include <pipeyaml/pipeyaml.h>
 
 // 简单的YAML解析辅助函数
 struct Config {
@@ -25,56 +25,85 @@ struct Config {
     std::string csrf_header_name = "X-CSRF-Token";
 };
 
-// 使用 yaml-cpp 库解析 YAML 配置文件
+// 从 YAML 映射节点中安全读取一个键。
+//
+// PipeYAML 与 yaml-cpp 在这里有三处语义差异，直接照搬 yaml-cpp 的写法会出 bug：
+//  1. PipeYAML 的 Node 没有 operator bool，yaml-cpp 的 `if (root["k"])` 判定
+//     键是否存在，在 PipeYAML 里必须显式调 is_defined()；
+//  2. PipeYAML 的非 const operator[] 会在键不存在时「创建」一个 undefined
+//     条目并写回映射，读取时必须用 const 引用查，否则会污染配置树；
+//  3. 非 map 节点上做键查找会抛 YAML::Exception，调用前必须确认 is_map()。
+//
+// 读不到、类型不匹配一律返回 fallback，绝不把异常抛给调用方。
+template <typename T>
+T yamlGet(const YAML::Node& map, const std::string& key, T fallback) {
+    if (!map.is_map()) return fallback;
+    YAML::Node node = map[key];
+    if (!node.is_defined()) return fallback;
+    try {
+        return node.as<T>();
+    } catch (const YAML::Exception&) {
+        return fallback;
+    }
+}
+
+// 使用 PipeYAML 库解析 YAML 配置文件
 Config parseConfigFile(const std::string& config_path) {
     Config config;
-    
+
     try {
-        // 加载并解析 YAML 配置文件
-        YAML::Node root = YAML::LoadFile(config_path);
-        
+        // 加载并解析 YAML 配置文件。
+        // 注意：PipeYAML 的 LoadFile 有 std::string 与 std::filesystem::path 两个
+        // 重载，直接传 const char* 字面量会因转换歧义编译失败，必须显式给
+        // std::string。
+        YAML::Node root = YAML::LoadFile(std::string(config_path));
+
+        if (!root.is_map()) {
+            LOG_WARNING("配置文件根节点不是映射结构: " + config_path + "，使用默认配置");
+            return config;
+        }
+
+        // const 引用：避免 PipeYAML 的 operator[] 在键缺失时创建条目
+        const YAML::Node& map = root;
+
         // 解析基本认证配置
-        if (root["enable_basic_auth"]) {
-            config.enable_basic_auth = root["enable_basic_auth"].as<bool>();
-        }
-        
+        config.enable_basic_auth =
+            yamlGet<bool>(map, "enable_basic_auth", config.enable_basic_auth);
+
         // 解析请求大小限制配置
-        if (root["set_request_size_limit"]) {
-            config.set_request_size_limit = root["set_request_size_limit"].as<bool>();
-        }
-        if (root["max_request_size"]) {
-            try {
-                config.max_request_size = root["max_request_size"].as<size_t>();
-            } catch (const std::exception& e) {
-                LOG_WARNING("无效的max_request_size值: " + std::string(e.what()) + "，使用默认值");
-            }
-        }
-        
+        config.set_request_size_limit =
+            yamlGet<bool>(map, "set_request_size_limit", config.set_request_size_limit);
+        config.max_request_size =
+            yamlGet<size_t>(map, "max_request_size", config.max_request_size);
+
         // 解析 CSRF 保护配置
-        if (root["enable_csrf_protection"]) {
-            config.enable_csrf_protection = root["enable_csrf_protection"].as<bool>();
-        }
-        if (root["csrf_cookie_name"]) {
-            config.csrf_cookie_name = root["csrf_cookie_name"].as<std::string>();
-        }
-        if (root["csrf_header_name"]) {
-            config.csrf_header_name = root["csrf_header_name"].as<std::string>();
-        }
-        
+        config.enable_csrf_protection =
+            yamlGet<bool>(map, "enable_csrf_protection", config.enable_csrf_protection);
+        config.csrf_cookie_name =
+            yamlGet<std::string>(map, "csrf_cookie_name", config.csrf_cookie_name);
+        config.csrf_header_name =
+            yamlGet<std::string>(map, "csrf_header_name", config.csrf_header_name);
+
         // 解析调试模式配置
-        if (root["enable_debug_mode"]) {
-            config.enable_debug_mode = root["enable_debug_mode"].as<bool>();
-        }
-        
+        config.enable_debug_mode =
+            yamlGet<bool>(map, "enable_debug_mode", config.enable_debug_mode);
+
         LOG_INFO("成功解析配置文件: " + config_path);
-    } catch (const YAML::BadFile& e) {
-        LOG_WARNING("无法打开配置文件: " + config_path + " (" + std::string(e.what()) + ")，使用默认配置");
     } catch (const YAML::Exception& e) {
-        LOG_ERROR("解析配置文件时出错: " + std::string(e.what()) + "，使用默认配置");
+        // PipeYAML 没有 yaml-cpp 的 YAML::BadFile，文件打不开与语法错误
+        // 都归到 YAML::Exception（前者是 ParserException，后者可能是
+        // ScannerException / ParserException / RepresentationException）。
+        // 这里按消息区分，文件不存在属于可预期的正常情况，只记警告。
+        std::string msg = e.what();
+        if (msg.find("Cannot open file") != std::string::npos) {
+            LOG_WARNING("无法打开配置文件: " + config_path + " (" + msg + ")，使用默认配置");
+        } else {
+            LOG_ERROR("解析配置文件时出错: " + msg + "，使用默认配置");
+        }
     } catch (const std::exception& e) {
         LOG_ERROR("读取配置文件时发生未知错误: " + std::string(e.what()) + "，使用默认配置");
     }
-    
+
     return config;
 }
 
@@ -294,7 +323,7 @@ int main(int argc, char* argv[]) {
         });
 
     // 测试GET方法
-    server.get("/api/users", [](const HttpRequest& request) -> HttpResponse {
+    server.get("/api/users", [](const HttpRequest&) -> HttpResponse {
         HttpResponse response;
         response.status_code = "200";
         response.headers["Content-Type"] = "application/json";

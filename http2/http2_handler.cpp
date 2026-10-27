@@ -2,6 +2,10 @@
 #include <nghttp2/nghttp2.h>
 #include <vector>
 #include <cstring>
+// ALPN 设置与错误码读取需要 OpenSSL 的显式头文件。
+// boost/asio/ssl.hpp 会间接引入 ssl.h，但 err.h 不在其中。
+#include <openssl/ssl.h>
+#include <openssl/err.h>
 #include "../single_include/logger.h"
 
 #undef LOG_TRACE
@@ -107,12 +111,14 @@ ssize_t Http2Session::sendData(const uint8_t* data, size_t length) {
     return 0;
 }
 
-int Http2Session::processData(const uint8_t* data, size_t length) {
+ssize_t Http2Session::processData(const uint8_t* data, size_t length) {
     if (!session_) return -1;
-    
-    int rv = nghttp2_session_mem_recv(session_, data, length);
+
+    // nghttp2_session_mem_recv 返回已消费的字节数（ssize_t），负值是错误码。
+    // 之前接进 int 会在单次接收超过 2GB 时静默截断。
+    ssize_t rv = nghttp2_session_mem_recv(session_, data, length);
     if (rv < 0) {
-        LOG_ERROR("HTTP/2 data processing error: " + std::string(nghttp2_strerror(rv)));
+        LOG_ERROR("HTTP/2 data processing error: " + std::string(nghttp2_strerror(static_cast<int>(rv))));
     }
     return rv;
 }
@@ -121,10 +127,10 @@ int Http2Session::submitResponse(int32_t stream_id,
                                   const std::vector<std::pair<std::string, std::string>>& headers,
                                   const std::string& body) {
     if (!session_) return -1;
-    
+
     std::vector<nghttp2_nv> nva;
     nva.reserve(headers.size());
-    
+
     for (const auto& [name, value] : headers) {
         nghttp2_nv hdr;
         hdr.name = reinterpret_cast<uint8_t*>(const_cast<char*>(name.c_str()));
@@ -134,15 +140,63 @@ int Http2Session::submitResponse(int32_t stream_id,
         hdr.flags = NGHTTP2_NV_FLAG_NONE;
         nva.push_back(hdr);
     }
-    
-    int rv = nghttp2_submit_response(session_, stream_id, 
+
+    // nghttp2_submit_response 的最后一个参数是 data_provider。这里传
+    // provider，由它在 END_STREAM 之前把 body 拉出来发走。
+    //
+    // 关键：body 非空时不能直接用 nghttp2_submit_response(..., nullptr)，
+    // 那样响应头一发完就带 END_STREAM，body 永远发不出去——这正是本函数
+    // 之前丢掉 body 的原因。
+    nghttp2_data_provider provider;
+    provider.source.ptr = this;
+    provider.read_callback = s_read_body_callback;
+
+    pending_body_ = body;
+    pending_body_pos_ = 0;
+
+    int rv = nghttp2_submit_response(session_, stream_id,
                                       nva.data(), nva.size(),
-                                      nullptr);
+                                      body.empty() ? nullptr : &provider);
     if (rv != 0) {
         LOG_ERROR("HTTP/2 submit response error: " + std::string(nghttp2_strerror(rv)));
+        pending_body_.clear();
+        pending_body_pos_ = 0;
     }
-    
+
     return rv;
+}
+
+// 从 pending_body_ 拉取下一片数据交给 nghttp2 发送。
+// 返回实际写入 buf 的字节数；返回 0 且置 EOF 表示 body 已发完。
+ssize_t Http2Session::s_read_body_callback(nghttp2_session* /*session*/,
+                                            int32_t /*stream_id*/,
+                                            uint8_t* buf, size_t length,
+                                            uint32_t* data_flags,
+                                            nghttp2_data_source* /*source*/,
+                                            void* user_data) {
+    auto* self = static_cast<Http2Session*>(user_data);
+    if (!self || !buf || length == 0) {
+        if (data_flags) *data_flags = NGHTTP2_DATA_FLAG_EOF;
+        return 0;
+    }
+
+    size_t remaining = self->pending_body_.size() - self->pending_body_pos_;
+    if (remaining == 0) {
+        if (data_flags) *data_flags = NGHTTP2_DATA_FLAG_EOF;
+        return 0;
+    }
+
+    size_t chunk = remaining < length ? remaining : length;
+    std::memcpy(buf, self->pending_body_.data() + self->pending_body_pos_, chunk);
+    self->pending_body_pos_ += chunk;
+
+    if (data_flags) {
+        // 全部发完时带上 EOF，让 nghttp2 结束该 stream
+        *data_flags = (self->pending_body_pos_ >= self->pending_body_.size())
+                          ? NGHTTP2_DATA_FLAG_EOF
+                          : NGHTTP2_DATA_FLAG_NONE;
+    }
+    return static_cast<ssize_t>(chunk);
 }
 
 int Http2Session::submitGoaway() {
@@ -166,7 +220,29 @@ void Http2Handler::handleConnection(tcp::socket socket) {
 }
 
 void Http2Handler::setupAlpn(ssl::context& ctx) {
-    LOG_INFO("HTTP/2 ALPN configured for SSL connections");
+    // 通过 TLS 扩展 ALPN 协商出 h2。
+    // 之前这个函数只打了一行日志就返回，SSL_CTX 上从未设置过 ALPN 协议，
+    // 导致 TLS 握手即使成功也协商不出 h2，客户端只能回落到 http/1.1。
+    //
+    // ALPN 协议列表是长度前缀的字节串：\x02h2（"h2" 前跟 1 字节长度 2）。
+    // 只声明 h2 而不声明 http/1.1，是因为本模块只处理 h2 流。
+    static const unsigned char kAlpnProtoList[] = {
+        0x02, 'h', '2'
+    };
+
+    if (SSL_CTX_set_alpn_protos(ctx.native_handle(),
+                                kAlpnProtoList,
+                                static_cast<unsigned int>(sizeof(kAlpnProtoList))) != 0) {
+        // 返回非 0 表示失败，可用 SSL_CTX_get_error 查具体原因
+        unsigned long err = ERR_get_error();
+        char buf[256] = {0};
+        if (err) {
+            ERR_error_string_n(err, buf, sizeof(buf));
+        }
+        LOG_ERROR("Failed to set ALPN protocols for HTTP/2: " + std::string(buf));
+    } else {
+        LOG_INFO("HTTP/2 ALPN configured for SSL connections");
+    }
 }
 
 bool Http2Handler::isAvailable() {

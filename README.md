@@ -123,10 +123,19 @@
 ```bash
 # Ubuntu/Debian
 sudo apt-get install libboost-dev libssl-dev libsqlite3-dev \
-                     libnghttp2-dev libyaml-cpp-dev zlib1g-dev cmake
+                     libnghttp2-dev zlib1g-dev cmake
+
+# PipeYAML 替代了 yaml-cpp，但 apt / vcpkg 都没有对应包，需从源码构建。
+# 它是纯静态库，无需拷贝运行时依赖。
+git clone --depth 1 https://github.com/zhaoliangcn/PipeYAML.git /tmp/PipeYAML
+cmake -S /tmp/PipeYAML -B /tmp/PipeYAML/build -DCMAKE_BUILD_TYPE=Release \
+      -DPYPEYAML_BUILD_TESTS=OFF -DPYPEYAML_BUILD_BENCHMARKS=OFF
+cmake --build /tmp/PipeYAML/build
+cmake --install /tmp/PipeYAML/build --prefix /tmp/PipeYAML-install
 
 git clone <repo-url> && cd httpserver2
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+      -DHS2_PIPEYAML_ROOT=/tmp/PipeYAML-install
 cmake --build build
 ```
 
@@ -135,11 +144,19 @@ Windows（MSVC + vcpkg）：
 ```powershell
 vcpkg install boost-asio:x64-windows-static openssl:x64-windows-static `
             zlib:x64-windows-static sqlite3:x64-windows-static `
-            yaml-cpp:x64-windows-static nghttp2:x64-windows-static
+            nghttp2:x64-windows-static
+
+git clone --depth 1 https://github.com/zhaoliangcn/PipeYAML.git $env:TEMP\PipeYAML
+cmake -S "$env:TEMP\PipeYAML" -B "$env:TEMP\PipeYAML\build" -A x64 `
+      -DCMAKE_BUILD_TYPE=Release `
+      -DPYPEYAML_BUILD_TESTS=OFF -DPYPEYAML_BUILD_BENCHMARKS=OFF
+cmake --build "$env:TEMP\PipeYAML\build" --config Release
+cmake --install "$env:TEMP\PipeYAML\build" --config Release --prefix "$env:TEMP\PipeYAML-install"
 
 cmake -S . -B build -A x64 `
   -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" `
-  -DCMAKE_BUILD_TYPE=Release
+  -DCMAKE_BUILD_TYPE=Release `
+  -DHS2_PIPEYAML_ROOT="$env:TEMP/PipeYAML-install"
 cmake --build build --config Release
 ```
 
@@ -150,7 +167,7 @@ cmake -S . -B build \
   -DHS2_DEPS_ROOT=/opt/deps \
   -DHS2_BOOST_ROOT=/opt/deps/boost_1_86_0 \
   -DHS2_OPENSSL_ROOT=/opt/deps/openssl-3.3.1-install \
-  -DHS2_YAML_CPP_ROOT=/opt/deps/yaml-cpp \
+  -DHS2_PIPEYAML_ROOT=/opt/deps/PipeYAML-install \
   -DHS2_NGHTTP2_ROOT=/opt/deps/nghttp2-install \
   -DHS2_TINYDB_ROOT=/opt/deps/TinyDB
 ```
@@ -393,7 +410,7 @@ server.enableCors(cors);
 |------|------|------|
 | Boost | ≥1.86 | Asio、Beast、Regex |
 | OpenSSL | ≥3.0 | SSL/TLS、加密 |
-| yaml-cpp | - | 配置文件解析 |
+| PipeYAML | ≥0.1.0 | 配置文件解析（YAML 1.2，替代 yaml-cpp） |
 | SQLite3 | ≥3.31 | 嵌入式数据库 |
 | nghttp2 | ≥1.40 | HTTP/2 协议 |
 | TinyDB | - | 可选数据库后端 |
@@ -401,7 +418,7 @@ server.enableCors(cors);
 ## 测试
 
 ```bash
-# C++ 单元测试（250 用例）
+# C++ 单元测试（258 用例）
 ./build/bin/test_unit
 
 # Python 集成测试

@@ -29,6 +29,21 @@ private:
     std::function<ssize_t(const uint8_t*, size_t)> send_callback_;
     bool initialized_ = false;
 
+    // 待发送的响应体。
+    // nghttp2 的 nghttp2_submit_data 通过 data_provider 回调按需拉取数据，
+    // 没有「传一段 buffer 就发完」的简化接口，所以 body 必须由会话持有，
+    // 在 read_callback 里分片交出。
+    std::string pending_body_;
+    size_t pending_body_pos_ = 0;
+
+    // 从 pending_body_ 中读取下一片数据供 nghttp2 发送
+    static ssize_t s_read_body_callback(nghttp2_session* session,
+                                         int32_t stream_id,
+                                         uint8_t* buf, size_t length,
+                                         uint32_t* data_flags,
+                                         nghttp2_data_source* source,
+                                         void* user_data);
+
 public:
     Http2Session() = default;
     ~Http2Session();
@@ -37,7 +52,9 @@ public:
     bool initServer();
 
     // 处理接收到的数据
-    int processData(const uint8_t* data, size_t length);
+    // 返回 nghttp2_session_mem_recv 的原始结果：已消费的字节数（ssize_t），
+    // 负值表示错误码。用 int 会在单次接收超过 2GB 时截断。
+    ssize_t processData(const uint8_t* data, size_t length);
 
     // 发送数据（由回调调用）
     ssize_t sendData(const uint8_t* data, size_t length);

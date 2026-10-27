@@ -10,7 +10,7 @@ disable_model_invocation: false
 ## 技术栈
 - **语言**: C++17
 - **HTTP/HTTPS**: Boost.Asio + OpenSSL 3.0
-- **配置**: yaml-cpp (YAML 格式)
+- **配置**: PipeYAML (YAML 1.2 格式，替代 yaml-cpp)
 - **构建**: Makefile + CMake
 - **编译**: g++ -std=c++17 -O2
 
@@ -29,7 +29,7 @@ testhttpserver2/
 
 ## 架构规则
 1. **核心类**: `HttpServer2` 在 `httpserver2.h` 中声明，`httpserver2.cpp` 中实现
-2. **配置**: 使用 YAML 格式（yaml-cpp 解析），通过 `config.yaml` 加载
+2. **配置**: 使用 YAML 格式（PipeYAML 解析），通过 `config.yaml` 加载
 3. **安全**: 支持基本认证、CSRF 保护、请求大小限制、TLS/SSL
 4. **功能**: HTTP/HTTPS 服务、WebSocket、反向代理、内容压缩、缓存、MIME 类型
 5. **日志**: 写入 `server.log`、`access.log`、`error.log`

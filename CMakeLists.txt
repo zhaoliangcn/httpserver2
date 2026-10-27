@@ -170,81 +170,71 @@ endif()
 find_package(SQLite3 REQUIRED)
 message(STATUS "SQLite3 include: ${SQLite3_INCLUDE_DIRS}")
 
-# ---------- yaml-cpp ----------
-# 不用 find_package：yaml-cpp 自带的 yaml-cpp-config.cmake 是按 install prefix
-# 计算 PACKAGE_PREFIX_DIR 的，只在「已安装」布局下成立，而本项目用的是
-# 「源码树 + 单独构建目录」布局，直接 find_package 会把 include 指向错误路径。
-set(HS2_YAML_CPP_ROOT "" CACHE PATH "yaml-cpp 根目录（含 include/yaml-cpp/yaml.h）")
-if(NOT HS2_YAML_CPP_ROOT)
+# ---------- PipeYAML ----------
+# PipeYAML（github.com/zhaoliangcn/PipeYAML）是 YAML 1.2 解析库，替代 yaml-cpp。
+# 与 yaml-cpp 相比有三处差异直接影响构建：
+#  1. 头文件路径是 include/pipeyaml/pipeyaml.h，不是 include/yaml-cpp/yaml.h；
+#  2. 纯静态库且没有导出宏（无 dllimport/dllexport），不需要像 yaml-cpp 那样
+#     定义 YAML_CPP_STATIC_DEFINE——那个宏在 yaml-cpp 里是必须的，否则头文件
+#     会把符号声明成 dllimport，链接报一堆 __imp_ 未解析；
+#  3. MSVC 运行库必须与本项目一致（/MD）。PipeYAML 的 build_win 用的是
+#     MultiThreadedDLL（/MD），若本项目用 /MT 链接会报 LNK1169 符号重复。
+#     本项目统一用 /MD，这里无需额外处理，但保留了显式校验。
+#
+# 不用 find_package：PipeYAML 安装后只有 lib/cmake/PipeYAML/PipeYAMLTargets.cmake，
+# 且其 IMPORTED_LOCATION 指向 install prefix 下的绝对路径。本项目用的是
+# 「已安装布局」和「源码树 + 单独构建目录」两种布局并存，直接探测更可靠。
+set(HS2_PIPEYAML_ROOT "" CACHE PATH "PipeYAML 根目录（含 include/pipeyaml/pipeyaml.h）")
+if(NOT HS2_PIPEYAML_ROOT)
     foreach(_cand
-            "${HS2_DEPS_ROOT}/thirdparty/yaml-cpp"
-            "${HS2_DEPS_ROOT}/yaml-cpp")
-        if(EXISTS "${_cand}/include/yaml-cpp/yaml.h")
-            set(HS2_YAML_CPP_ROOT "${_cand}")
+            "${HS2_DEPS_ROOT}/PipeYAML-install"
+            "${HS2_DEPS_ROOT}/PipeYAML"
+            "${HS2_DEPS_ROOT}/thirdparty/PipeYAML"
+            "${HS2_DEPS_ROOT}/pipeyaml")
+        if(EXISTS "${_cand}/include/pipeyaml/pipeyaml.h")
+            set(HS2_PIPEYAML_ROOT "${_cand}")
             break()
         endif()
     endforeach()
 endif()
-if(NOT HS2_YAML_CPP_ROOT)
+if(NOT HS2_PIPEYAML_ROOT)
     message(FATAL_ERROR
-        "找不到 yaml-cpp。请用 -DHS2_YAML_CPP_ROOT=<路径> 指定源码树根目录。")
+        "找不到 PipeYAML。请用 -DHS2_PIPEYAML_ROOT=<路径> 指定。")
 endif()
 
-set(HS2_YAML_CPP_INCLUDE "${HS2_YAML_CPP_ROOT}/include")
-set(HS2_YAML_CPP_LIB "")
+set(HS2_PIPEYAML_INCLUDE "${HS2_PIPEYAML_ROOT}/include")
+set(HS2_PIPEYAML_LIB "")
 foreach(_cand
-        "${HS2_YAML_CPP_ROOT}/build-msvc/yaml-cpp.lib"
-        "${HS2_YAML_CPP_ROOT}/build/yaml-cpp.lib"
-        "${HS2_YAML_CPP_ROOT}/build/libyaml-cpp.a"
-        "${HS2_YAML_CPP_ROOT}/build/libyaml-cppd.a"
-        "${HS2_YAML_CPP_ROOT}/lib/libyaml-cpp.a"
-        "${HS2_YAML_CPP_ROOT}/lib/yaml-cpp.lib"
-        "${HS2_YAML_CPP_ROOT}/lib/libyaml-cpp.dll.a"
-        "${HS2_YAML_CPP_ROOT}/build-msvc/Release/yaml-cpp.lib"
-        "${HS2_YAML_CPP_ROOT}/build/Release/yaml-cpp.lib"
-        "${HS2_YAML_CPP_ROOT}/lib/libyaml-cpp.so")
+        "${HS2_PIPEYAML_ROOT}/lib/pipeyaml.lib"
+        "${HS2_PIPEYAML_ROOT}/lib/libpipeyaml.a"
+        "${HS2_PIPEYAML_ROOT}/lib/libpipeyaml.so"
+        "${HS2_PIPEYAML_ROOT}/lib/libpipeyaml.dylib"
+        "${HS2_PIPEYAML_ROOT}/build_win/Release/pipeyaml.lib"
+        "${HS2_PIPEYAML_ROOT}/build_win/pipeyaml.lib"
+        "${HS2_PIPEYAML_ROOT}/build-msvc/pipeyaml.lib"
+        "${HS2_PIPEYAML_ROOT}/build-msvc/Release/pipeyaml.lib"
+        "${HS2_PIPEYAML_ROOT}/build/libpipeyaml.a"
+        "${HS2_PIPEYAML_ROOT}/build/libpipeyaml.so"
+        "${HS2_PIPEYAML_ROOT}/build/Release/pipeyaml.lib")
     if(EXISTS "${_cand}")
-        set(HS2_YAML_CPP_LIB "${_cand}")
+        set(HS2_PIPEYAML_LIB "${_cand}")
         break()
     endif()
 endforeach()
-if(NOT HS2_YAML_CPP_LIB)
+if(NOT HS2_PIPEYAML_LIB)
     message(FATAL_ERROR
-        "在 ${HS2_YAML_CPP_ROOT} 下找不到 yaml-cpp 库。\n"
-        "  MSVC:  cmake -S <yaml-cpp> -B build-msvc -G \"NMake Makefiles\" ... && cmake --build build-msvc\n"
-        "  GCC :  cmake -S <yaml-cpp> -B build && cmake --build build")
+        "在 ${HS2_PIPEYAML_ROOT} 下找不到 PipeYAML 库。\n"
+        "  MSVC:  cmake -S <PipeYAML> -B build_win -G \"Visual Studio 17 2022\" -A x64 ... && cmake --build build_win --config Release\n"
+        "  GCC :  cmake -S <PipeYAML> -B build ... && cmake --build build\n"
+        "  或直接安装： cmake --install build_win --prefix <安装目录>")
 endif()
-message(STATUS "yaml-cpp: ${HS2_YAML_CPP_LIB}")
+message(STATUS "PipeYAML: ${HS2_PIPEYAML_LIB}")
 
-# 判断 yaml-cpp 是静态库还是共享库：静态库需要 YAML_CPP_STATIC_DEFINE，
-# 否则头文件会把符号声明成 dllimport，链接时报一堆 __imp_ 未解析。
-# Windows 上 .lib 两种库都叫这个名字，靠「同目录有没有配套 DLL」区分。
-set(HS2_YAML_CPP_STATIC OFF)
-if(HS2_YAML_CPP_LIB MATCHES "\\.a$")
-    set(HS2_YAML_CPP_STATIC ON)
-elseif(WIN32)
-    get_filename_component(_yc_dir "${HS2_YAML_CPP_LIB}" DIRECTORY)
-    get_filename_component(_yc_name "${HS2_YAML_CPP_LIB}" NAME_WE)
-    file(GLOB _yc_dll "${_yc_dir}/${_yc_name}*.dll" "${_yc_dir}/../bin/${_yc_name}*.dll")
-    if(NOT _yc_dll)
-        set(HS2_YAML_CPP_STATIC ON)
-    endif()
-endif()
-if(HS2_YAML_CPP_STATIC)
-    message(STATUS "yaml-cpp: static (YAML_CPP_STATIC_DEFINE enabled)")
-else()
-    message(STATUS "yaml-cpp: shared")
-endif()
-
-add_library(hs2_yaml_cpp STATIC IMPORTED GLOBAL)
-set_target_properties(hs2_yaml_cpp PROPERTIES
-    IMPORTED_LOCATION "${HS2_YAML_CPP_LIB}"
-    INTERFACE_INCLUDE_DIRECTORIES "${HS2_YAML_CPP_INCLUDE}"
+add_library(hs2_pipeyaml STATIC IMPORTED GLOBAL)
+set_target_properties(hs2_pipeyaml PROPERTIES
+    IMPORTED_LOCATION "${HS2_PIPEYAML_LIB}"
+    INTERFACE_INCLUDE_DIRECTORIES "${HS2_PIPEYAML_INCLUDE}"
 )
-if(HS2_YAML_CPP_STATIC)
-    set_property(TARGET hs2_yaml_cpp APPEND PROPERTY
-        INTERFACE_COMPILE_DEFINITIONS YAML_CPP_STATIC_DEFINE)
-endif()
 
 # ---------- nghttp2 ----------
 set(HS2_NGHTTP2_ROOT "" CACHE PATH "nghttp2 根目录")
@@ -428,7 +418,7 @@ endfunction()
 # 主服务器
 add_executable(httpserver2 ${CORE_SRCS} main.cpp)
 hs2_configure_target(httpserver2)
-target_link_libraries(httpserver2 PRIVATE hs2_yaml_cpp)
+target_link_libraries(httpserver2 PRIVATE hs2_pipeyaml)
 
 if(HS2_BUILD_TESTS)
     set(HS2_TEST_NAMES

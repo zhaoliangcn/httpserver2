@@ -154,7 +154,7 @@ int main(int argc, char* argv[]) {
     std::cout << "调试模式: " << (debug_mode ? "已启用" : "已禁用") << std::endl;
     
     // 设置路由
-    server.get("/", [](const HttpRequest& request) {
+    server.get("/", [](const HttpRequest& /*request*/) {
         HttpResponse response;
         response.status_code = "200";
         response.status_message = "OK";
@@ -163,7 +163,7 @@ int main(int argc, char* argv[]) {
         return response;
     });
     
-    server.get("/test", [](const HttpRequest& request) {
+    server.get("/test", [](const HttpRequest& /*request*/) {
         // 模拟一些处理时间
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
         HttpResponse response;
@@ -175,7 +175,7 @@ int main(int argc, char* argv[]) {
     });
     
     // 添加性能监控路由
-    server.get("/metrics", [&server](const HttpRequest& request) {
+    server.get("/metrics", [&server](const HttpRequest& /*request*/) {
         HttpResponse response;
         response.status_code = "200";
         response.status_message = "OK";

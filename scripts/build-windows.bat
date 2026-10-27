@@ -23,8 +23,8 @@ rem ---------- dependency paths ----------
 set BOOST_DIR=D:\boost_1_86_0
 set OPENSSL_DIR=D:\openssl-3.3.1-install
 set ZLIB_DIR=D:\zlib-install
-set YAMLCPP_DIR=D:\yaml-cpp
-set YAMLCPP_LIB_DIR=D:\yaml-cpp\build-msvc
+set PIPEYAML_DIR=D:\PipeYAML-install
+set PIPEYAML_LIB_DIR=D:\PipeYAML-install\lib
 set SQLITE_DIR=D:\sqlite-install
 set TINYDB_DIR=D:\TinyDB
 set TINYDB_LIB_DIR=D:\TinyDB\build_win\Release
@@ -71,13 +71,14 @@ rem   quotes, producing confusing bogus syntax errors.
 set DEFS=/D_CRT_SECURE_NO_WARNINGS /D_WIN32_WINNT=0x0A00 /DNOMINMAX /D_AMD64_
 rem NGHTTP2_STATICLIB: nghttp2 ships a static lib. Without this the headers
 rem   declare dllimport and the link fails with many unresolved __imp_nghttp2_*.
-rem YAML_CPP_STATIC_DEFINE: same story for yaml-cpp.
-set DEFS=%DEFS% /DNGHTTP2_STATICLIB /DYAML_CPP_STATIC_DEFINE
+rem PipeYAML needs no such macro: it is a plain static lib with no export
+rem   macros, so its headers never declare dllimport.
+set DEFS=%DEFS% /DNGHTTP2_STATICLIB
 
-set INCS=/I"%BOOST_DIR%" /I"%OPENSSL_DIR%\include" /I"%ZLIB_DIR%\include" /I"%YAMLCPP_DIR%\include" /I"%SQLITE_DIR%" /I"%TINYDB_DIR%\include" /I"%NGHTTP2_DIR%\include" /I"%CD%"
+set INCS=/I"%BOOST_DIR%" /I"%OPENSSL_DIR%\include" /I"%ZLIB_DIR%\include" /I"%PIPEYAML_DIR%\include" /I"%SQLITE_DIR%" /I"%TINYDB_DIR%\include" /I"%NGHTTP2_DIR%\include" /I"%CD%"
 
-set LIBPATHS=/LIBPATH:"%YAMLCPP_LIB_DIR%" /LIBPATH:"%OPENSSL_DIR%\lib" /LIBPATH:"%ZLIB_DIR%\lib" /LIBPATH:"%SQLITE_DIR%" /LIBPATH:"%TINYDB_LIB_DIR%" /LIBPATH:"%NGHTTP2_DIR%\lib"
-set SYSLIBS=yaml-cpp.lib libssl.lib libcrypto.lib zlib.lib sqlite3.lib tinydb_client.lib nghttp2.lib ws2_32.lib crypt32.lib advapi32.lib user32.lib
+set LIBPATHS=/LIBPATH:"%PIPEYAML_LIB_DIR%" /LIBPATH:"%OPENSSL_DIR%\lib" /LIBPATH:"%ZLIB_DIR%\lib" /LIBPATH:"%SQLITE_DIR%" /LIBPATH:"%TINYDB_LIB_DIR%" /LIBPATH:"%NGHTTP2_DIR%\lib"
+set SYSLIBS=pipeyaml.lib libssl.lib libcrypto.lib zlib.lib sqlite3.lib tinydb_client.lib nghttp2.lib ws2_32.lib crypt32.lib advapi32.lib user32.lib
 
 set COMMON_SRCS=logger_impl.cpp httpserver2.cpp auth\jwt.cpp validation\validator.cpp session\memory_store.cpp db\sqlite_database.cpp db\tinydb_database.cpp ws\websocket.cpp cache\memory_cache.cpp stream\streaming.cpp plugin\plugin_manager.cpp http2\http2_handler.cpp middleware\request_id.cpp docs\openapi.cpp
 

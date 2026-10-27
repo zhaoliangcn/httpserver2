@@ -59,12 +59,12 @@ static std::string gzipDecompress(const std::string& compressed) {
     z_stream zs{};
     inflateInit2(&zs, 16 + MAX_WBITS);
     zs.next_in = (Bytef*)compressed.data();
-    zs.avail_in = compressed.size();
+    zs.avail_in = static_cast<uLong>(compressed.size());
     std::string result;
     std::vector<char> buf(65536);
     do {
         zs.next_out = (Bytef*)buf.data();
-        zs.avail_out = buf.size();
+        zs.avail_out = static_cast<uInt>(buf.size());
         int ret = inflate(&zs, Z_FINISH);
         if (ret != Z_OK && ret != Z_STREAM_END) {
             inflateEnd(&zs);

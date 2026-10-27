@@ -53,7 +53,7 @@
 
 - **Windows SDK 的 `ERROR` 宏污染枚举**：`wingdi.h` 的 `#define ERROR 0` 把 `enum class Level { ERROR = 4 }` 展开成 `0 = 4`，产生一片指向无关位置的语法错误。两处枚举前加 `#undef ERROR`。
 - **TinyDB 宏使用 C++20 指定初始化器**：`TINYDB_DEFAULT_OPTIONS` 展开后是 designated initializers，项目标准 C++17，MSVC 报 C7555。改为逐字段赋值。
-- **`main.cpp` 硬编码兄弟目录**：`../thirdparty/yaml-cpp/include/...` 改为 `<yaml-cpp/yaml.h>`。
+- **`main.cpp` 硬编码兄弟目录**：`../thirdparty/yaml-cpp/include/...` 改为 `<yaml-cpp/yaml.h>`（后续已随 yaml-cpp → PipeYAML 替换改为 `<pipeyaml/pipeyaml.h>`）。
 - **`plugin_manager.cpp` 依赖 POSIX `<dlfcn.h>`**：加 `_WIN32` 下的 POSIX 兼容垫片，两平台共用同一套调用形式。
 - **nghttp2 在 Windows 下缺 `ssize_t`**：include 前用 UCRT 的 `SSIZE_T` 补别名。
 - **`async_read` 回调漏捕获 `client_ip`**：真 bug，由本次修复引入，`/Zs` 语法检查查不出，靠完整编译（`/c`）才暴露。
@@ -76,15 +76,17 @@
 | W-7 | 一批未使用参数 / 隐式窄化转换告警（`size_t→uInt`、`_Rep→double`、`size_t→int`、lambda 未用 `request`、`http2` 回调未用形参、`gzip` 赋值窄化） | ✅ 已修 | 加显式 cast 或改用匹配类型；回调未用形参去掉形参名（保留类型维持续约）；`getRequestsPerSecond` 改用 `duration<double>` |
 | W-8 | `http2/http2_handler.cpp` `sendData` 返回 `int` 但 nghttp2 send 回调契约为 `ssize_t`（负值表示错误） | ✅ 已修 | `Http2Session::sendData` 与 `setSendCallback` 签名统一改为 `ssize_t` |
 | W-9 | 死代码：`docs/openapi.cpp` 的 `generateFromRoutes` / `registerApiDocs` 为空实现且无人调用 | ⚠️ 标注 | 保留未用形参标注，在 P2-10 已记录为功能缺失项 |
+| W-10 | 全量干净重编（`nmake clean` + `nmake`）相比增量构建多暴露 4 处告警实例，增量构建因命中缓存而漏检：① `RegexRouteMatcher::match` 用 `size_t` 下标传给 `boost::match_results::operator[](int)` → C4267；② `test_unit.cpp` gzip 解压把 `size_t` 赋给 zlib 的 `uLong`/`uInt`（`avail_in`/`avail_out`）→ C4267；③ `test_concurrent.cpp` 三处 lambda 形参 `const HttpRequest& request` 未使用 → C4100 | ✅ 已修 | ① 下标循环改 `int` 并 `static_cast<int>(matches.size())`；② `avail_in/avail_out` 显式 `static_cast<uLong>/<uInt>(size)`；③ 三个 lambda 形参名改为 `/*request*/` |
 
 ### 验证结果
 
 Windows + VS2022(BuildTools 14.44) + CMake 3.31.3 + Boost 1.86 + OpenSSL 3.3.1：
 
 - 21 个编译单元 `/Zs` 语法检查零错误
-- 完整编译链接 `httpserver2.exe` / `test_unit.exe`：**零错误、零警告、零链接告警**（MSVC 全部警告开启）
+- 完整编译链接 `httpserver2.exe` / `test_unit.exe`：**零错误、零警告、零链接告警**（MSVC 全部警告开启）。**注**：曾因增量构建命中缓存漏检 4 处告警，已通过 `nmake clean` + `nmake` 全量干净重编复核，并按 W-10 修复后再次确认全量零警告
 - `test_unit.exe`：**258 用例全部通过**（250 原用例 + 本轮新增的 `executeTransaction` 等用例）
 - 真实 HTTP 请求：`/health` 返回 200 且安全头齐全；`/metrics` 带 `Accept-Encoding: gzip` 返回 `Content-Encoding: gzip` 与 `Vary: Accept-Encoding`；404 路径安全头同样齐全；`/static/` 返回 200
+- **PipeYAML 替换 yaml-cpp 后复核**：`httpserver2.exe 8080` 启动，`config.yaml` 经 PipeYAML 解析无误——`max_request_size: 5242880` 正确转为 5MB、`csrf_cookie_name/header_name` 与 `enable_debug_mode` 均按文件生效、`enable_basic_auth: true` 使全部路由返回 401（无凭据时属预期），全程无 "无法打开配置文件 / 解析配置文件时出错" 日志
 - `-DHS2_WITH_TINYDB=OFF` 的配置与构建同样通过
 - 端口校验验证：`start(70000)` 因越界被拒，不会静默监听错误端口
 

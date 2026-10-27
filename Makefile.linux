@@ -2,8 +2,8 @@
 
 # Compiler and flags
 CXX = g++
-CXXFLAGS = -std=c++17 -Wall -Wextra -I../boost_1_86_0_install/include -I../openssl-3.1.0/include -O2 -I../thirdparty/yaml-cpp/include/
-LDFLAGS = -L../boost_1_86_0_install/lib -L../openssl-3.1.0/lib -L../thirdparty/yaml-cpp/build -Wl,-rpath,'$$ORIGIN' -Wl,-rpath,../openssl-3.1.0/lib -Wl,-rpath,../boost_1_86_0_install/lib -lboost_system -lboost_thread -lpthread -lssl -lcrypto -lyaml-cpp -lz
+CXXFLAGS = -std=c++17 -Wall -Wextra -I../boost_1_86_0_install/include -I../openssl-3.1.0/include -O2 -I../PipeYAML-install/include
+LDFLAGS = -L../boost_1_86_0_install/lib -L../openssl-3.1.0/lib -L../PipeYAML-install/lib -Wl,-rpath,'$$ORIGIN' -Wl,-rpath,../openssl-3.1.0/lib -Wl,-rpath,../boost_1_86_0_install/lib -lboost_system -lboost_thread -lpthread -lssl -lcrypto -lpipeyaml -lz
 
 # Target names
 TARGET = httpserver2

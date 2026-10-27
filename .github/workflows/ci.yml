@@ -20,12 +20,26 @@ jobs:
           sudo apt-get install -y \
             libboost-dev \
             libssl-dev \
-            libyaml-cpp-dev \
             libnghttp2-dev \
             libsqlite3-dev \
             zlib1g-dev \
             cmake \
-            ninja-build
+            ninja-build \
+            git
+
+      # PipeYAML 替代了 yaml-cpp，但两者都不在发行版的软件源里
+      # （apt 没有 libpipeyaml，vcpkg 也没有对应 port），只能从源码构建。
+      # 它是纯静态库，构建产物不需要额外拷贝运行时依赖。
+      - name: Build PipeYAML
+        run: |
+          git clone --depth 1 https://github.com/zhaoliangcn/PipeYAML.git /tmp/PipeYAML
+          cmake -S /tmp/PipeYAML -B /tmp/PipeYAML/build \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DPYPEYAML_BUILD_TESTS=OFF \
+            -DPYPEYAML_BUILD_BENCHMARKS=OFF
+          cmake --build /tmp/PipeYAML/build
+          cmake --install /tmp/PipeYAML/build --prefix /tmp/PipeYAML-install
 
       # 依赖查找顺序：
       #   1) find_package 走系统安装（libssl-dev 等提供 cmake config）
@@ -37,7 +51,7 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DHS2_DEPS_ROOT="${GITHUB_WORKSPACE}/.." \
             -DHS2_OPENSSL_ROOT=/usr \
-            -DHS2_YAML_CPP_ROOT=/usr
+            -DHS2_PIPEYAML_ROOT=/tmp/PipeYAML-install
 
       - name: Build
         run: cmake --build build --target httpserver2 test_unit
@@ -58,15 +72,27 @@ jobs:
       - name: Install dependencies
         shell: pwsh
         run: |
-          # vcpkg 提供 OpenSSL / zlib / sqlite3 / yaml-cpp / nghttp2 的 Windows 版
+          # vcpkg 提供 OpenSSL / zlib / sqlite3 / nghttp2 的 Windows 版
           # 头文件与库。Boost 只用 header-only 部分，vcpkg 的 boost-asio 头即可。
+          # PipeYAML 不在 vcpkg 的 port 列表里，单独从源码构建。
           vcpkg install boost-asio:x64-windows-static `
             openssl:x64-windows-static `
             zlib:x64-windows-static `
             sqlite3:x64-windows-static `
-            yaml-cpp:x64-windows-static `
             nghttp2:x64-windows-static
           Write-Host "VCPKG_ROOT=$env:VCPKG_ROOT"
+
+      - name: Build PipeYAML
+        shell: pwsh
+        run: |
+          git clone --depth 1 https://github.com/zhaoliangcn/PipeYAML.git $env:RUNNER_TEMP\PipeYAML
+          cmake -S "$env:RUNNER_TEMP\PipeYAML" -B "$env:RUNNER_TEMP\PipeYAML\build" `
+            -A x64 `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DPYPEYAML_BUILD_TESTS=OFF `
+            -DPYPEYAML_BUILD_BENCHMARKS=OFF
+          cmake --build "$env:RUNNER_TEMP\PipeYAML\build" --config Release
+          cmake --install "$env:RUNNER_TEMP\PipeYAML\build" --config Release --prefix "$env:RUNNER_TEMP\PipeYAML-install"
 
       - name: Configure
         shell: pwsh
@@ -77,7 +103,7 @@ jobs:
             -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" `
             -DCMAKE_BUILD_TYPE=Release `
             -DHS2_BOOST_ROOT="$env:VCPKG_ROOT/installed/x64-windows/include" `
-            -DHS2_YAML_CPP_ROOT="$env:VCPKG_ROOT/installed/x64-windows" `
+            -DHS2_PIPEYAML_ROOT="$env:RUNNER_TEMP/PipeYAML-install" `
             -DHS2_NGHTTP2_ROOT="$env:VCPKG_ROOT/installed/x64-windows" `
             -DHS2_TINYDB_ROOT="$env:VCPKG_ROOT/installed/x64-windows"
 

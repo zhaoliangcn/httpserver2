@@ -1224,12 +1224,13 @@ bool RegexRouteMatcher::match(const std::string& path, std::unordered_map<std::s
         boost::smatch matches;
         if (boost::regex_match(path, matches, regex_)) {
             // 提取捕获组作为路径参数，使用捕获组索引作为键
-            // matches.size() 返回 boost::smatch::size_type（有符号），用同样的
-            // 类型遍历，避免 size_t / ptrdiff_t 混比产生的告警与潜在下溢。
-            // boost::smatch::size_type 是 ptrdiff_t（有符号），std::to_string
-            // 没有对应的重载，转换到 long long 才是无歧义的。
-            for (boost::smatch::size_type i = 1; i < matches.size(); i++) {
-                path_params[std::to_string(static_cast<long long>(i))] = matches[i].str();
+            // 注意：boost::match_results::operator[] 接受 int 下标（见
+            // match_results.hpp 的 operator[](int sub)），因此下标必须用 int
+            // 类型遍历，避免把 size_t 传给 int 参数触发 C4267。子匹配数量
+            // 实际远小于 INT_MAX，转 int 安全。
+            const int sub_count = static_cast<int>(matches.size());
+            for (int i = 1; i < sub_count; ++i) {
+                path_params[std::to_string(i)] = matches[i].str();
             }
             return true;
         }
