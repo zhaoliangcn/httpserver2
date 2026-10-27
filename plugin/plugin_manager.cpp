@@ -1,5 +1,44 @@
 #include "plugin.h"
-#include <dlfcn.h>
+
+#ifdef _WIN32
+#  include <windows.h>
+#  include <cstdio>
+// Windows 没有 dlfcn.h。这里补一组同名的 POSIX 兼容垫片，让下面的加载逻辑
+// 不必整份改写成 LoadLibrary/GetProcAddress，两种平台共用同一套调用形式。
+#  ifndef RTLD_NOW
+#    define RTLD_NOW 2
+#  endif
+namespace {
+inline void* dlopen(const char* path, int /*mode*/) {
+    return reinterpret_cast<void*>(::LoadLibraryA(path));
+}
+inline void* dlsym(void* handle, const char* symbol) {
+    return reinterpret_cast<void*>(
+        ::GetProcAddress(reinterpret_cast<HMODULE>(handle), symbol));
+}
+inline int dlclose(void* handle) {
+    return ::FreeLibrary(reinterpret_cast<HMODULE>(handle)) ? 0 : -1;
+}
+inline const char* dlerror() {
+    // 返回值必须在下一次调用之前保持有效，故用线程局部静态缓冲
+    // （多工作线程同时加载插件时互不覆盖）。
+    static thread_local char buffer[512] = {0};
+    const DWORD code = ::GetLastError();
+    const DWORD len = ::FormatMessageA(
+        FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+        nullptr, code, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
+        buffer, static_cast<DWORD>(sizeof(buffer)), nullptr);
+    if (len == 0) {
+        std::snprintf(buffer, sizeof(buffer), "Win32 error %lu",
+                      static_cast<unsigned long>(code));
+    }
+    return buffer;
+}
+} // namespace
+#else
+#  include <dlfcn.h>
+#endif
+
 #include <filesystem>
 #include "../single_include/logger.h"
 

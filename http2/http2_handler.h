@@ -5,6 +5,15 @@
 #include <functional>
 #include <string>
 #include <vector>
+
+#ifdef _WIN32
+// Windows 没有 ssize_t，而 nghttp2 的旧版回调 typedef（nghttp2_send_callback 等）
+// 用的就是 ssize_t。UCRT 的 <BaseTsd.h> 提供 SSIZE_T（即 LONG_PTR，与 64 位
+// 平台的 ssize_t 同宽），补一个兼容别名即可，不必改动 nghttp2 头文件本身。
+#  include <BaseTsd.h>
+typedef SSIZE_T ssize_t;
+#endif
+
 #include <nghttp2/nghttp2.h>
 #include "../httpserver2.h"
 

@@ -483,7 +483,10 @@ static void test_securityHeadersContent() {
     TEST("Permissions-Policy 含 camera=()",       pp.find("camera=()") != std::string::npos);
     TEST("Permissions-Policy 含 microphone=()",   pp.find("microphone=()") != std::string::npos);
     TEST("Permissions-Policy 含 geolocation=()",  pp.find("geolocation=()") != std::string::npos);
-    TEST("Permissions-Policy 含 interest-cohort=()", pp.find("interest-cohort=()") != std::string::npos);
+    // interest-cohort（FLoC）已被浏览器废弃，实现里已移除该指令。
+    // 这里断言它不再出现，防止有人误加回来。
+    TEST("Permissions-Policy 不含已废弃的 interest-cohort",
+         pp.find("interest-cohort") == std::string::npos);
 
     // Referrer-Policy 值
     ASSERT_EQ(r.headers["Referrer-Policy"], "strict-origin-when-cross-origin");

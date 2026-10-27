@@ -1573,8 +1573,9 @@ void HttpServer2::handleClient(StreamType stream, bool use_ssl) {
     });
     
     // 异步读取请求
+    // 捕获 client_ip：WebSocket 升级分支要用它构造会话（按值拷贝，每个连接一份）。
     http::async_read(*stream_ptr, *buffer, *parser,
-        [this, stream_ptr, buffer, parser, timer, debug_info, use_ssl](beast::error_code ec, std::size_t bytes_transferred) {
+        [this, stream_ptr, buffer, parser, timer, debug_info, use_ssl, client_ip](beast::error_code ec, std::size_t bytes_transferred) {
             boost::system::error_code timer_ec;
             timer->cancel(timer_ec);
             boost::ignore_unused(bytes_transferred);

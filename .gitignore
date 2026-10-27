@@ -1,6 +1,14 @@
 # 构建产物
 build/
+build-win/
 *.o
+*.obj
+*.exe
+*.dll
+*.pdb
+*.ilk
+*.exp
+*.lib
 *.so
 *.dylib
 httpserver2
