@@ -119,6 +119,19 @@ public:
     bool beginTransaction() override;
     bool commit() override;
     bool rollback() override;
+
+    // --- 元数据查询（TinyDB 专有） ---
+    //
+    // 为什么单独开方法而不是走 execute()：TinyDB 嵌入式路径的 SQL 解析器
+    // 不支持 pg_catalog / information_schema，SHOW DATABASES 也没有接上
+    // 执行分支，所以表/索引清单只能由引擎的 catalog 直接导出。
+    // 这些方法不参与 Database 抽象接口，仅 TinyDBDatabase 提供。
+    //
+    // 成功返回 true，json 为引擎给出的 JSON 文本；
+    // 失败返回 false，error 为原因。
+    bool listTables(std::string& json, std::string& error);
+    bool describeTable(const std::string& table_name, std::string& json, std::string& error);
+    bool listIndexes(const std::string& table_name, std::string& json, std::string& error);
 };
 
 }} // namespace http2::db

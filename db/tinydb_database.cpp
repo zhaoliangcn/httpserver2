@@ -195,4 +195,45 @@ bool TinyDBDatabase::rollback() {
     return tinydb_rollback(client_);
 }
 
+// ============================================================
+// 元数据查询
+//
+// 引擎侧返回的是堆上的 JSON 字符串，这里接过来拷进 std::string
+// 并立刻释放，避免调用方忘记 free 造成泄漏。
+// ============================================================
+namespace {
+// 统一处理 "引擎返回 char* → 填充 json/error" 的搬运逻辑
+bool TakeEngineJson(char* raw, void* client, std::string& json, std::string& error) {
+    if (!raw) {
+        const char* msg = client ? tinydb_error(client) : nullptr;
+        error = (msg && msg[0]) ? msg : "metadata query failed";
+        return false;
+    }
+    json.assign(raw);
+    tinydb_free_string(raw);
+    return true;
+}
+} // namespace
+
+bool TinyDBDatabase::listTables(std::string& json, std::string& error) {
+    if (!client_) { error = "not connected"; return false; }
+    return TakeEngineJson(tinydb_list_tables(client_), client_, json, error);
+}
+
+bool TinyDBDatabase::describeTable(const std::string& table_name,
+                                   std::string& json, std::string& error) {
+    if (!client_) { error = "not connected"; return false; }
+    if (table_name.empty()) { error = "table name is empty"; return false; }
+    return TakeEngineJson(tinydb_describe_table(client_, table_name.c_str()),
+                          client_, json, error);
+}
+
+bool TinyDBDatabase::listIndexes(const std::string& table_name,
+                                 std::string& json, std::string& error) {
+    if (!client_) { error = "not connected"; return false; }
+    if (table_name.empty()) { error = "table name is empty"; return false; }
+    return TakeEngineJson(tinydb_list_indexes(client_, table_name.c_str()),
+                          client_, json, error);
+}
+
 }} // namespace http2::db
