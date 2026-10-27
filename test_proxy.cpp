@@ -45,21 +45,18 @@ int main(int argc, char* argv[]) {
         log_set_level(LOG_LEVEL_INFO);
         
         // 添加基本中间件
-        server.use([](const HttpRequest& request) -> HttpResponse {
+        server.use([](const HttpRequest& request) -> std::optional<HttpResponse> {
             std::cout << "[LOG] " << request.method << " " << request.path << std::endl;
-            HttpResponse response;
-            response.status_code = "404";
-            return response;
+            return std::nullopt;   // 放行
         });
         
         // 添加CORS中间件
-        server.use([](const HttpRequest& request) -> HttpResponse {
-            HttpResponse response;
-            if (request.method == "OPTIONS") {
-                response.status_code = "204";
-            } else {
-                response.status_code = "404";
+        server.use([](const HttpRequest& request) -> std::optional<HttpResponse> {
+            if (request.method != "OPTIONS") {
+                return std::nullopt;   // 非预检请求：放行
             }
+            HttpResponse response;
+            response.status_code = "204";
             response.headers["Access-Control-Allow-Origin"] = "*";
             response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS";
             response.headers["Access-Control-Allow-Headers"] = "Content-Type";

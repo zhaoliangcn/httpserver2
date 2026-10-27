@@ -205,6 +205,18 @@ struct HttpRequest {
     std::unordered_map<std::string, std::string> json_body;  // JSON请求体（解析后）
     std::atomic<bool> is_processed{false};  // 用于并发处理控制
     std::string request_id;     // 唯一请求 ID（用于链路追踪）
+
+    // 中间件 → 最终响应的单向通道。
+    // 中间件在 handler 之前执行，此时最终 HttpResponse 还不存在，
+    // 需要下发 Cookie / 响应头的中间件（Session、Request-ID 等）把内容写在这里，
+    // 框架在发送前合并进最终响应（用户处理器显式设置的头部优先）。
+    std::unordered_map<std::string, std::string> pending_response_headers;
+    std::vector<std::string> pending_response_cookies;
+
+    // 客户端 TCP 对端地址（如 "127.0.0.1"）。
+    // 由框架在收到请求时填入；HTTPS 与 HTTP 都可用。
+    // 仅供审计/日志展示，转发头（X-Forwarded-For）可能更接近真实来源。
+    std::string remote_ip;
     
     // 客户端 socket（流式响应用，如反向代理直接转发）
     // 仅 HTTP 使用；HTTPS 不流式转发
@@ -227,6 +239,9 @@ struct HttpRequest {
         , json_body(std::move(other.json_body))
         , is_processed(other.is_processed.load())
         , request_id(std::move(other.request_id))
+        , pending_response_headers(std::move(other.pending_response_headers))
+        , pending_response_cookies(std::move(other.pending_response_cookies))
+        , remote_ip(std::move(other.remote_ip))
         , client_socket(std::move(other.client_socket))
     {}
     
@@ -245,6 +260,9 @@ struct HttpRequest {
             json_body = std::move(other.json_body);
             is_processed.store(other.is_processed.load());
             request_id = std::move(other.request_id);
+            pending_response_headers = std::move(other.pending_response_headers);
+            pending_response_cookies = std::move(other.pending_response_cookies);
+            remote_ip = std::move(other.remote_ip);
             client_socket = std::move(other.client_socket);
         }
         return *this;
@@ -273,12 +291,19 @@ enum class HttpErrorType {
 
 // HTTP响应结构
 struct HttpResponse {
-    std::string status_code;   // 状态码
-    std::string status_message; // 状态消息
-    std::unordered_map<std::string, std::string> headers;  // 响应头
+    std::string status_code = "200";   // 状态码（默认 200，避免忘记赋值时写出 "HTTP/1.1 0"）
+    std::string status_message = "OK"; // 状态消息
+    std::unordered_map<std::string, std::string> headers;  // 响应头（单值头）
+    // 多值 Set-Cookie：headers 是 map，只能容纳一个 Set-Cookie，
+    // 会导致 Session Cookie 与 CSRF Cookie 互相覆盖（以及上游多个 Set-Cookie 丢失）。
+    // 这里单独保存，发送时逐条 append。
+    std::vector<std::string> set_cookies;
     std::string body;          // 响应体
     std::string file_body_path; // 非空时使用 sendfile 零拷贝发送文件，body 将被忽略
     bool response_sent = false; // true 表示响应已被流式发送（代理场景），无需再次发送
+
+    // 追加一条 Set-Cookie（推荐使用，避免覆盖）
+    void addCookie(const std::string& cookie) { set_cookies.push_back(cookie); }
 };
 
 // 错误响应生成函数
@@ -298,7 +323,20 @@ struct RequestQueueItem {
 };
 
 // 中间件函数类型
-typedef std::function<HttpResponse(const HttpRequest&)> Middleware;
+//
+// 契约（2.6 起，破坏性变更）：
+//   - 返回 std::nullopt      → 放行，继续执行下一个中间件 / 最终路由处理器
+//   - 返回 HttpResponse      → 已处理该请求，中断中间件链并直接返回该响应
+//                              （例如 401/403/400、缓存命中）
+//
+// 旧版本用「返回 404 表示放行」，与真实 404 响应无法区分，且与内置中间件
+// （jwt / session / cache / validator 放行时返回 200）互相矛盾，导致一旦启用
+// 这些中间件，所有请求都会被判定为"已处理"而返回空 200。故改为显式契约。
+//
+// 参数为 HttpRequest&：中间件需要把认证结果（如 JWT claims、Session ID）
+// 写回请求供下游处理器读取，而旧的 const 引用无法做到。
+// 以 `const HttpRequest&` 为参数的 lambda 仍可隐式转换，旧代码无需改写。
+typedef std::function<std::optional<HttpResponse>(HttpRequest&)> Middleware;
 
 // 错误处理中间件工厂函数
 Middleware createErrorHandlingMiddleware();
@@ -386,6 +424,7 @@ private:
     std::string key_path_;
     std::string cipher_suites_;  // 密码套件配置
     std::unordered_map<std::string, std::pair<std::string, std::string>> basic_auth_users_;  // 用户名 -> {盐, 密码哈希}
+    std::mutex basic_auth_mutex_;  // 保护 basic_auth_users_（可能在运行时 addUser）
     std::string basic_auth_realm_;  // 基本认证域（为空则不启用）
     bool csrf_protection_enabled_ = false;
     std::string csrf_token_header_ = "X-CSRF-Token";
@@ -398,6 +437,7 @@ private:
     std::chrono::seconds request_timeout_ = std::chrono::seconds(30);  // 默认请求超时时间
     std::mutex stop_mutex_;  // 用于保护stop操作的互斥锁
     std::atomic<bool> running_ = false;  // 服务器运行状态（原子变量确保线程可见性）
+    std::atomic<bool> stopped_{false};   // stop() 是否已完成资源回收（保证幂等）
     std::vector<std::shared_ptr<net::steady_timer>> request_timers_;  // 跟踪所有请求定时器
     std::mutex timers_mutex_;  // 保护定时器列表的互斥锁
     
@@ -425,7 +465,9 @@ private:
     // 限流相关
     std::atomic<size_t> request_count_ = 0;
     std::chrono::steady_clock::time_point rate_limit_window_;
-    size_t requests_per_second_ = 0;  // 0表示不限流
+    std::mutex rate_limit_mutex_;                     // 保护 rate_limit_window_（会被多线程读写）
+    std::atomic<size_t> requests_per_second_{0};      // 全局 RPS 上限，0 表示不限
+    std::atomic<bool> ip_rate_limit_enabled_{false};  // IP 级限流开关
     size_t max_queue_size_ = 1000;
     RateLimiter rate_limiter_;  // IP级别的速率限制器
     
@@ -446,6 +488,9 @@ private:
     
     // CORS 配置
     CorsConfig cors_config_;
+
+    // 反向代理流式转发（默认关闭，见 setProxyStreaming）
+    std::atomic<bool> proxy_streaming_enabled_{false};
     
     // 原生 WebSocket 处理器注册表（使用 shared_ptr 避免不完整类型问题）
     std::unordered_map<std::string, std::shared_ptr<http2::ws::WebSocketHandler>> ws_handlers_;
@@ -479,8 +524,12 @@ private:
     void handleClient(StreamType stream, bool use_ssl);
 
     // 请求处理函数
-    std::optional<Route> findRoute(const std::string& method, const std::string& path, std::unordered_map<std::string, std::string>& params);
-    HttpResponse handleMiddlewareChain(const HttpRequest& request, const std::vector<Middleware>& middlewares, size_t index, const RouteHandler& final_handler);
+    // host 单独传入（虚拟主机匹配），不再混进 path_params —— 否则 Host 值会
+    // 混入路径参数，静态文件子路径处理器按"第一个参数"取相对路径时会取到 Host。
+    std::optional<Route> findRoute(const std::string& method, const std::string& host,
+                                   const std::string& path, std::unordered_map<std::string, std::string>& params);
+    HttpResponse handleMiddlewareChain(HttpRequest& request, const std::vector<Middleware>& middlewares,
+                                       size_t index, const RouteHandler& final_handler);
     HttpResponse defaultHandler(const HttpRequest& request);
 
     // 解析函数
@@ -514,8 +563,10 @@ public:
     bool isRunning() const;
     void setRequestTimeout(std::chrono::seconds timeout);
     
-    // 设置限流参数
-    void setRateLimit(size_t requests_per_second, size_t max_queue_size = 1000);
+    // 全局 QPS 限流（按秒窗口），0 表示不限
+    // 注意：不要同时提供 setRateLimit(size_t,size_t) 与 setRateLimit(uint32_t,uint32_t) ——
+    // 以 int 字面量调用时两者都是标准转换、同等级，会产生重载二义（编译错误）。
+    void setGlobalRateLimit(size_t requests_per_second, size_t max_queue_size = 1000);
     
     // 连接池设置
     void setConnectionPoolSettings(size_t max_connections, std::chrono::seconds max_idle_time);
@@ -594,6 +645,12 @@ public:
 
     // WebSocket 代理：将 WebSocket 连接双向转发到目标服务器
     void addWebSocketProxy(const std::string& path, const std::string& target_url);
+
+    // 反向代理流式转发开关（默认关闭）。
+    // 开启后代理会把上游响应体按 64KB 块直接写给客户端，避免整包缓冲；
+    // 但该路径是同步阻塞写，且需要请求对象持有客户端 socket。
+    // 默认关闭以保证正确性与并发安全，确认后端行为可预测后再开启。
+    void setProxyStreaming(bool enable);
     
     // 原生 WebSocket 端点注册
     void addWebSocket(const std::string& path, const http2::ws::WebSocketHandler& handler);

@@ -34,7 +34,10 @@ private:
 
 public:
     Session(const std::string& id, std::chrono::seconds ttl)
-        : id_(id), last_access_(std::chrono::steady_clock::now()), ttl_(ttl) {}
+        : id_(id), last_access_(std::chrono::steady_clock::now()), ttl_(ttl), dirty_(true) {}
+    // 注：新建的 Session 必须是 dirty 的。旧实现默认 dirty_=false，
+    // 而 MemorySessionStore::save() 遇到 !isDirty() 直接返回 ——
+    // 新会话永远不会入库，每个请求都会重新生成 Session ID。
 
     const std::string& id() const { return id_; }
     bool isExpired() const {

@@ -1,5 +1,6 @@
 #include "cache.h"
 #include <shared_mutex>
+#include <map>
 
 namespace http2 { namespace cache {
 
@@ -129,22 +130,26 @@ size_t MemoryCache::size() const {
 // ============================================================
 Middleware cacheMiddleware(std::shared_ptr<Cache> cache, 
                            std::chrono::seconds ttl) {
-    return [cache, ttl](const HttpRequest& req) -> HttpResponse {
-        // 只缓存 GET 请求
+    return [cache, ttl](HttpRequest& req) -> std::optional<HttpResponse> {
+        // 只缓存 GET 请求（其他方法直接放行）
         if (req.method != "GET") {
-            HttpResponse resp;
-            resp.status_code = "200";
-            resp.status_message = "OK";
-            return resp;
+            return std::nullopt;
         }
         
-        // 生成缓存键
+        // 缓存键：path + 排序后的查询参数 + 凭据指纹。
+        // 凭据指纹不可省 —— 只用 path/query 做键会把 A 用户的响应返回给 B 用户。
         std::string cache_key = req.path;
         // 按参数排序确保一致性
         std::map<std::string, std::string> sorted_params(req.query_params.begin(), 
                                                           req.query_params.end());
         for (const auto& [k, v] : sorted_params) {
             cache_key += "&" + k + "=" + v;
+        }
+        if (auto it = req.headers.find("Authorization"); it != req.headers.end()) {
+            cache_key += "#auth:" + std::to_string(std::hash<std::string>{}(it->second));
+        }
+        if (auto it = req.headers.find("Cookie"); it != req.headers.end()) {
+            cache_key += "#sess:" + std::to_string(std::hash<std::string>{}(it->second));
         }
         
         // 尝试从缓存获取
@@ -154,19 +159,18 @@ Middleware cacheMiddleware(std::shared_ptr<Cache> cache,
             resp.status_code = "200";
             resp.status_message = "OK (cached)";
             resp.body = *cached;
-            resp.headers["Content-Type"] = "application/json";
             resp.headers["X-Cache"] = "HIT";
-            return resp;
+            return resp;   // 有值 = 已处理，中断链
         }
         
-        // 未命中 — 返回空响应让中间件链继续
-        // 下游 handler 处理完请求后，需要通过响应头 X-Cache-Store 告知缓存
-        HttpResponse resp;
-        resp.status_code = "200";
-        resp.status_message = "OK";
-        resp.headers["X-Cache"] = "MISS";
-        resp.headers["X-Cache-Key"] = cache_key;
-        return resp;
+        // 未命中：放行到 handler。
+        // TODO(cache): 写回缓存需要一个"handler 执行后"的钩子，
+        //   当前中间件契约拿不到最终响应，因此本中间件目前只能命中不能填充。
+        //   在补齐之前请勿把 cacheMiddleware 当作生产级缓存使用。
+        req.pending_response_headers["X-Cache"] = "MISS";
+        req.pending_response_headers["X-Cache-Key"] = cache_key;
+        (void)ttl;
+        return std::nullopt;
     };
 }
 

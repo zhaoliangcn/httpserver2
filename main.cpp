@@ -254,7 +254,7 @@ int main(int argc, char* argv[]) {
         server.use(createErrorHandlingMiddleware());
         
         // 添加日志中间件
-        server.use([](const HttpRequest& request) -> HttpResponse {
+        server.use([](const HttpRequest& request) -> std::optional<HttpResponse> {
         std::cout << "[LOG] " << request.method << " " << request.path << std::endl;
         if (!request.query_params.empty()) {
             std::cout << "[LOG] Query params:" << std::endl;
@@ -262,25 +262,22 @@ int main(int argc, char* argv[]) {
                 std::cout << "  " << key << " = " << value << std::endl;
             }
         }
-        // 返回404让后续处理器继续处理
-        HttpResponse response;
-        response.status_code = "404";
-        return response;
+        // 返回 nullopt = 放行给后续中间件 / 路由处理器
+        return std::nullopt;
     });
 
     // 添加CORS中间件
-        server.use([](const HttpRequest& request) -> HttpResponse {
-            HttpResponse response;
-            if (request.method == "OPTIONS") {
-                response.status_code = "204";
-                response.status_message = "No Content";
-            } else {
-                response.status_code = "404";
+        server.use([](const HttpRequest& request) -> std::optional<HttpResponse> {
+            if (request.method != "OPTIONS") {
+                return std::nullopt;   // 非预检请求：放行
             }
+            HttpResponse response;
+            response.status_code = "204";
+            response.status_message = "No Content";
             response.headers["Access-Control-Allow-Origin"] = "*";
             response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS";
             response.headers["Access-Control-Allow-Headers"] = "Content-Type";
-            return response;
+            return response;   // 有值 = 已处理预检请求
         });
 
         // 添加示例路由 - 主页

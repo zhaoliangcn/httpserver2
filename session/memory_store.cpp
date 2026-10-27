@@ -2,6 +2,8 @@
 #include <random>
 #include <sstream>
 #include <chrono>
+#include <stdexcept>
+#include <openssl/rand.h>
 
 namespace http2 { namespace session {
 
@@ -9,16 +11,18 @@ namespace http2 { namespace session {
 // Session ID 生成
 // ============================================================
 std::string MemorySessionStore::generateSessionId() {
-    static const std::string charset = 
-        "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
-    std::random_device rd;
-    std::mt19937 gen(rd());
-    std::uniform_int_distribution<> dist(0, static_cast<int>(charset.size()) - 1);
-    
+    // 32 字节 CSPRNG → 64 个十六进制字符。
+    // 旧实现用 std::mt19937：输出可由少量样本推导，会话 ID 可被预测（会话劫持）。
+    unsigned char buf[32];
+    if (RAND_bytes(buf, static_cast<int>(sizeof(buf))) != 1) {
+        throw std::runtime_error("generateSessionId: RAND_bytes failed");
+    }
+    static const char* hex = "0123456789abcdef";
     std::string id;
-    id.reserve(64);
-    for (int i = 0; i < 64; ++i) {
-        id += charset[dist(gen)];
+    id.reserve(sizeof(buf) * 2);
+    for (unsigned char c : buf) {
+        id += hex[c >> 4];
+        id += hex[c & 0x0f];
     }
     return id;
 }
@@ -73,11 +77,7 @@ void MemorySessionStore::cleanup() {
 // Session 中间件
 // ============================================================
 Middleware sessionMiddleware(std::shared_ptr<SessionStore> store, const SessionConfig& config) {
-    return [store, config](const HttpRequest& req) -> HttpResponse {
-        HttpResponse resp;
-        resp.status_code = "200";
-        resp.status_message = "OK";
-        
+    return [store, config](HttpRequest& req) -> std::optional<HttpResponse> {
         // 从 Cookie 中获取 Session ID
         std::string session_id;
         auto cookie_it = req.headers.find("Cookie");
@@ -97,11 +97,9 @@ Middleware sessionMiddleware(std::shared_ptr<SessionStore> store, const SessionC
             session = store->load(session_id);
         }
         
-        bool is_new = false;
         if (!session) {
             session_id = MemorySessionStore::generateSessionId();
             session = std::make_shared<Session>(session_id, config.ttl);
-            is_new = true;
         }
         session->touch();
         
@@ -113,20 +111,19 @@ Middleware sessionMiddleware(std::shared_ptr<SessionStore> store, const SessionC
         if (!config.same_site.empty()) {
             cookie += "; SameSite=" + config.same_site;
         }
-        resp.headers["Set-Cookie"] = cookie;
+        // 不能直接写进"响应"：本中间件在 handler 之前执行，最终响应还不存在。
+        // 旧实现返回一个 200 响应，既中断了中间件链（请求再也到不了 handler），
+        // 又让 handler 自己的 Set-Cookie 被这个空响应覆盖。
+        req.pending_response_cookies.push_back(cookie);
         
-        // 通过响应头传递 Session 信息给下游处理器
-        resp.headers["X-Session-Id"] = session->id();
+        // 下游 handler 通过 req.headers["X-Session-Id"] 取当前会话
+        req.headers["X-Session-Id"] = session->id();
         
-        // 保存 Session
+        // 保存 Session（新建的 Session 构造时即为 dirty，确保能落库）
         store->save(session);
         
-        // 注意：这里不能直接修改 HttpRequest（const 引用）
-        // 实际使用中，Session 中间件应全局使用，且 Session ID 通过 Cookie 传递
-        // Handler 中通过 req.headers["Cookie"] 获取 Session ID 再查询
-        // 这里简化处理：将 Session ID 添加到响应头，供后续处理器使用
-        
-        return resp;
+        // nullopt = 放行
+        return std::nullopt;
     };
 }
 

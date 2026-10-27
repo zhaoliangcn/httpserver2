@@ -20,7 +20,15 @@
 #include <string>
 #include <mutex>
 #include <charconv>
+#include <ctime>
+#include <cstdio>
+#include <cstdint>
+#include <limits>
+#include <cctype>
 #include <zlib.h>
+#include <openssl/rand.h>
+#include <openssl/crypto.h>
+#include <openssl/evp.h>
 #include <boost/bind/bind.hpp>
 #include <boost/beast/http.hpp>
 #include <boost/beast/version.hpp>
@@ -55,6 +63,20 @@ bool RateLimiter::isAllowed(const std::string& client_ip)
     std::lock_guard<std::mutex> lock(ip_requests_mutex_);
     
     auto now = std::chrono::steady_clock::now();
+    
+    // 定期回收空条目：旧实现只清理 vector 内容、从不删除 map 条目，
+    // 攻击者用大量随机源 IP 即可让该 map 无限增长（内存型 DoS）。
+    if (ip_requests_.size() > 10000) {
+        for (auto it = ip_requests_.begin(); it != ip_requests_.end(); ) {
+            bool stale = true;
+            for (const auto& t : it->second) {
+                if (t >= now - window_size_) { stale = false; break; }
+            }
+            if (stale) it = ip_requests_.erase(it);
+            else ++it;
+        }
+    }
+    
     auto& request_times = ip_requests_[client_ip];
     
     // 清除超出时间窗口的请求
@@ -90,6 +112,13 @@ void RateLimiter::setRateLimit(uint32_t requests_per_window, uint32_t window_siz
 // gzip压缩函数
 std::string gzipCompress(const std::string& data) {
     if (data.empty()) {
+        return data;
+    }
+    
+    // zlib 的 avail_in 是 uInt（32 位），超过 4GB 会被静默截断，
+    // 结果是一个只含前 4GB 数据的"合法"压缩流 —— 必须提前返回。
+    if (data.size() > static_cast<size_t>(std::numeric_limits<uInt>::max())) {
+        LOG_WARNING("gzipCompress: input exceeds 4GB, skipped");
         return data;
     }
     
@@ -142,53 +171,145 @@ std::string gzipCompress(const std::string& data) {
 std::unordered_map<std::string, std::pair<uint64_t, uint64_t>> PerformanceMonitor::route_metrics_;
 
 // ============================================================
+// 时间 / 日志辅助（线程安全版本）
+// ============================================================
+// std::localtime / std::gmtime 返回指向静态缓冲区的指针，多线程并发调用是数据竞争
+// （会产生错乱的时间戳，甚至崩溃）。统一走 *_r / *_s 版本。
+static std::tm localTimeSafe(std::time_t t) {
+    std::tm tm_buf{};
+#if defined(_WIN32) && defined(_MSC_VER)
+    localtime_s(&tm_buf, &t);
+#else
+    localtime_r(&t, &tm_buf);
+#endif
+    return tm_buf;
+}
+
+static std::tm gmTimeSafe(std::time_t t) {
+    std::tm tm_buf{};
+#if defined(_WIN32) && defined(_MSC_VER)
+    gmtime_s(&tm_buf, &t);
+#else
+    gmtime_r(&t, &tm_buf);
+#endif
+    return tm_buf;
+}
+
+// JSON 字符串转义 —— 日志与错误响应都由用户可控内容拼接，
+// 不转义会让引号/换行破坏 JSON（日志注入、客户端解析失败）。
+static std::string jsonEscape(const std::string& in) {
+    std::string out;
+    out.reserve(in.size() + 8);
+    for (char c : in) {
+        switch (c) {
+            case '"':  out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\b': out += "\\b";  break;
+            case '\f': out += "\\f";  break;
+            case '\n': out += "\\n";  break;
+            case '\r': out += "\\r";  break;
+            case '\t': out += "\\t";  break;
+            default:
+                if (static_cast<unsigned char>(c) < 0x20) {
+                    char buf[7];
+                    std::snprintf(buf, sizeof(buf), "\\u%04x", static_cast<unsigned char>(c));
+                    out += buf;
+                } else {
+                    out += c;
+                }
+        }
+    }
+    return out;
+}
+
+// 纯文本日志字段清理：把控制字符（含换行）替换掉，防止伪造日志行
+static std::string sanitizeLogField(const std::string& in) {
+    std::string out;
+    out.reserve(in.size());
+    for (char c : in) {
+        unsigned char uc = static_cast<unsigned char>(c);
+        out += (uc < 0x20 || uc == 0x7f) ? ' ' : c;
+    }
+    return out;
+}
+
+// 密码学安全随机（CSRF 令牌、盐、WebSocket 会话 ID 等）。
+// std::mt19937 的输出可由少量样本推导，不能用于安全令牌。
+static std::string secureRandomHex(size_t num_bytes) {
+    std::vector<unsigned char> buf(num_bytes);
+    if (RAND_bytes(buf.data(), static_cast<int>(buf.size())) != 1) {
+        // 兜底：RAND_bytes 失败极罕见（熵源异常），退化到随机设备 + 计数器，
+        // 至少不返回可预测的空串。
+        static std::atomic<uint64_t> fallback_counter{0};
+        std::random_device rd;
+        for (size_t i = 0; i < num_bytes; ++i) {
+            buf[i] = static_cast<unsigned char>((rd() ^ fallback_counter.fetch_add(1)) & 0xff);
+        }
+        LOG_CRITICAL("RAND_bytes failed, falling back to weak randomness");
+    }
+    static const char* hex = "0123456789abcdef";
+    std::string out;
+    out.reserve(num_bytes * 2);
+    for (unsigned char c : buf) {
+        out += hex[c >> 4];
+        out += hex[c & 0x0f];
+    }
+    return out;
+}
+
+// ============================================================
 // 访问日志（独立的 Apache 风格 access log）
 // ============================================================
 static std::mutex g_access_log_mutex;
+static std::ofstream g_access_log_file;   // 常驻句柄：避免每请求 open/close
 
 void logAccess(const std::string& client_ip, const std::string& method, const std::string& path,
                const std::string& status_code, const std::string& user_agent, int response_time_ms,
                const std::string& request_id) {
-    std::lock_guard<std::mutex> lock(g_access_log_mutex);
     auto now = std::chrono::system_clock::now();
     auto time_t_now = std::chrono::system_clock::to_time_t(now);
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count() % 1000;
-    
+
+    std::tm tm_buf = localTimeSafe(time_t_now);
     std::stringstream ss;
-    ss << std::put_time(std::localtime(&time_t_now), "%Y-%m-%d %H:%M:%S.")
+    ss << std::put_time(&tm_buf, "%Y-%m-%d %H:%M:%S.")
        << std::setw(3) << std::setfill('0') << ms;
     std::string timestamp = ss.str();
-    
-    // 输出 JSON 格式的结构化日志
-    // 不转义字符串以保持可读性（实际生产环境应使用真正的 JSON 序列化）
-    ss.str("");
-    ss << "{\"time\":\"" << timestamp << "\","
-       << "\"client_ip\":\"" << client_ip << "\","
-       << "\"method\":\"" << method << "\","
-       << "\"path\":\"" << path << "\","
-       << "\"status\":\"" << status_code << "\","
-       << "\"duration_ms\":" << response_time_ms << ","
-       << "\"user_agent\":\"" << user_agent << "\"";
-    if (!request_id.empty()) {
-        ss << ",\"request_id\":\"" << request_id << "\"";
-    }
-    ss << "}";
-    std::string json_entry = ss.str();
-    
-    // 用新日志库的 INFO 级别输出（同时到控制台和文件）
-    // 同时保留旧格式用于兼容
-    LOG_INFO("[ACCESS] " + json_entry);
-    
-    // 也写入纯文本 access.log（通过全局互斥锁保护）
-    std::ofstream access_log("access.log", std::ios::app);
-    if (access_log.is_open()) {
-        std::string plain_entry = timestamp + " - " + client_ip + " - \"" + method + " " + path + "\" " +
-                                  status_code + " " + std::to_string(response_time_ms) + "ms - \"" + user_agent + "\"";
+
+    // JSON 格式结构化日志（所有字段转义）
+    std::string json_entry;
+    {
+        std::stringstream js;
+        js << "{\"time\":\"" << timestamp << "\","
+           << "\"client_ip\":\"" << jsonEscape(client_ip) << "\","
+           << "\"method\":\"" << jsonEscape(method) << "\","
+           << "\"path\":\"" << jsonEscape(path) << "\","
+           << "\"status\":\"" << jsonEscape(status_code) << "\","
+           << "\"duration_ms\":" << response_time_ms << ","
+           << "\"user_agent\":\"" << jsonEscape(user_agent) << "\"";
         if (!request_id.empty()) {
-            plain_entry += " - id:" + request_id;
+            js << ",\"request_id\":\"" << jsonEscape(request_id) << "\"";
         }
-        access_log << plain_entry << std::endl;
-        access_log.close();
+        js << "}";
+        json_entry = js.str();
+    }
+
+    LOG_INFO("[ACCESS] " + json_entry);
+
+    // 纯文本 access.log，句柄复用 + 互斥保护
+    std::lock_guard<std::mutex> lock(g_access_log_mutex);
+    if (!g_access_log_file.is_open()) {
+        g_access_log_file.open("access.log", std::ios::app);
+    }
+    if (g_access_log_file.is_open()) {
+        std::string plain_entry = timestamp + " - " + sanitizeLogField(client_ip) + " - \"" +
+                                  sanitizeLogField(method) + " " + sanitizeLogField(path) + "\" " +
+                                  sanitizeLogField(status_code) + " " + std::to_string(response_time_ms) +
+                                  "ms - \"" + sanitizeLogField(user_agent) + "\"";
+        if (!request_id.empty()) {
+            plain_entry += " - id:" + sanitizeLogField(request_id);
+        }
+        g_access_log_file << plain_entry << std::endl;
     }
 }
 
@@ -245,12 +366,12 @@ HttpResponse createErrorResponse(HttpErrorType error_type, const std::string& me
     // 设置Content-Type为JSON
     response.headers["Content-Type"] = "application/json";
     
-    // 构建JSON响应体
+    // 构建JSON响应体（message 可能来自异常文本等外部输入，必须转义）
     std::string error_message = message.empty() ? default_message : message;
     response.body = "{";
     response.body += "\"error\":{";
-    response.body += "\"code\":\"" + status_code + "\",";
-    response.body += "\"message\":\"" + error_message + "\"";
+    response.body += "\"code\":\"" + jsonEscape(status_code) + "\",";
+    response.body += "\"message\":\"" + jsonEscape(error_message) + "\"";
     response.body += "}";
     response.body += "}";
     
@@ -262,12 +383,10 @@ HttpResponse createErrorResponse(HttpErrorType error_type, const std::string& me
 
 // 错误处理中间件工厂函数
 Middleware createErrorHandlingMiddleware() {
-    return [](const HttpRequest& /* request */) -> HttpResponse {
-        // 这个中间件不做具体处理，只是让请求继续向下传递
-        // 真正的错误处理发生在defaultHandler和handleMiddlewareChain中
-        HttpResponse response;
-        response.status_code = "404"; // 继续处理，让后续处理器处理
-        return response;
+    // 纯放行中间件：异常捕获已统一收敛到 handleMiddlewareChain（fail-closed）。
+    // 旧实现返回 404 来"表示继续"，与真实 404 无法区分。
+    return [](HttpRequest& /* request */) -> std::optional<HttpResponse> {
+        return std::nullopt;
     };
 }
 
@@ -363,18 +482,13 @@ void HttpServer2::finalizeResponse(HttpResponse& response,
             has_csrf_cookie = (cookie_it->second.find(csrf_cookie_name_ + "=") != std::string::npos);
         }
         if (!has_csrf_cookie) {
-            const std::string charset = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
-            std::random_device rd;
-            std::mt19937 gen(rd());
-            std::uniform_int_distribution<> distrib(0, charset.size() - 1);
-            std::string csrf_token;
-            csrf_token.reserve(32);
-            for (int i = 0; i < 32; ++i) {
-                csrf_token += charset[distrib(gen)];
-            }
+            // 使用 CSPRNG 生成（std::mt19937 可预测，不能作为安全令牌）
+            std::string csrf_token = generateCsrfToken();
             std::string cookie = csrf_cookie_name_ + "=" + csrf_token + "; HttpOnly=false; SameSite=Strict; Path=/";
             if (use_ssl) cookie += "; Secure";
-            response.headers["Set-Cookie"] = cookie;
+            // 用 addCookie 而不是 headers["Set-Cookie"]：map 只能存一个，
+            // 会覆盖 Session 中间件下发的 Set-Cookie。
+            response.addCookie(cookie);
         }
     }
 
@@ -392,6 +506,37 @@ void HttpServer2::finalizeResponse(HttpResponse& response,
     }
 }
 
+// 判断 MIME 是否值得 gzip（对已压缩格式再压只是浪费 CPU）
+static bool isCompressibleContentType(const std::string& content_type) {
+    std::string base = content_type.substr(0, content_type.find(';'));
+    // 去首尾空白 + 转小写
+    size_t b = base.find_first_not_of(" \t");
+    size_t e = base.find_last_not_of(" \t");
+    if (b == std::string::npos) return false;
+    base = base.substr(b, e - b + 1);
+    std::transform(base.begin(), base.end(), base.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+
+    if (base.rfind("text/", 0) == 0) return true;
+    return base == "application/json" ||
+           base == "application/javascript" ||
+           base == "application/xml" ||
+           base == "application/xhtml+xml" ||
+           base == "application/rss+xml" ||
+           base == "application/atom+xml" ||
+           base == "image/svg+xml";
+}
+
+// 状态码解析 + 合法性校验：atoi 不会抛异常，且空串会得到 0，
+// 直接 http::status(0) 会写出 "HTTP/1.1 0" 这种非法状态行。
+static int parseStatusCode(const std::string& code_str) {
+    if (code_str.empty()) return 200;
+    int code = 0;
+    auto res = std::from_chars(code_str.data(), code_str.data() + code_str.size(), code);
+    if (res.ec != std::errc{} || code < 100 || code > 599) return 500;
+    return code;
+}
+
 void HttpServer2::buildAndSendResponse(tcp::socket& socket,
                                         HttpResponse& custom_response,
                                         const std::string& client_ip,
@@ -401,22 +546,24 @@ void HttpServer2::buildAndSendResponse(tcp::socket& socket,
                                         std::function<void()> on_complete) {
     // 如果响应已被流式发送（如反向代理直转），跳过
     if (custom_response.response_sent) {
-        if (keep_alive && on_complete) on_complete();
+        if (on_complete) on_complete();
         return;
     }
     
     // 如果设置了 file_body_path，使用 sendfile 零拷贝发送
     if (!custom_response.file_body_path.empty()) {
         sendFileResponse(socket, custom_response, client_ip, path);
+        // 修复：sendfile 分支此前直接 return，on_complete 不执行 →
+        // active_connections_ 只增不减，优雅关闭永远等满超时。
+        if (on_complete) on_complete();
         return;
     }
     
     auto response = std::make_shared<http::response<http::string_body>>();
 
-    // 状态码
-    int status_code = 500;
-    try { status_code = std::atoi(custom_response.status_code.c_str()); } catch (...) {}
-    response->result(http::status(status_code));
+    // 状态码（越界/空值回退）
+    const int status_int = parseStatusCode(custom_response.status_code);
+    response->result(http::status(status_int));
 
     // 响应体
     response->body() = custom_response.body;
@@ -425,6 +572,10 @@ void HttpServer2::buildAndSendResponse(tcp::socket& socket,
     for (const auto& [key, value] : custom_response.headers) {
         response->set(key, value);
     }
+    // 多值 Set-Cookie（Session / CSRF / 代理上游可能同时下发）
+    for (const auto& cookie : custom_response.set_cookies) {
+        response->insert(http::field::set_cookie, cookie);
+    }
 
     // Content-Type 默认值
     if (custom_response.headers.find("Content-Type") == custom_response.headers.end()) {
@@ -432,20 +583,34 @@ void HttpServer2::buildAndSendResponse(tcp::socket& socket,
     }
 
     // gzip 压缩
-    if (should_compress && !response->body().empty()) {
+    // 关键：上游/处理器可能已经设置了 Content-Encoding（例如反向代理原样透传
+    // 上游的 gzip 响应），此时再次压缩会产出 gzip(gzip(body)) 却仍标注单层编码，
+    // 客户端必然解码失败。
+    const bool already_encoded =
+        custom_response.headers.find("Content-Encoding") != custom_response.headers.end();
+    const std::string content_type =
+        custom_response.headers.count("Content-Type") ? custom_response.headers.at("Content-Type") : "text/plain";
+
+    if (should_compress && !already_encoded && isCompressibleContentType(content_type) &&
+        status_int != 206 && status_int != 304 &&
+        !response->body().empty()) {
         std::string compressed = gzipCompress(response->body());
         if (compressed.size() < response->body().size()) {
             response->body() = std::move(compressed);
             response->set(http::field::content_encoding, "gzip");
         }
+        // 只要响应可能随 Accept-Encoding 变化，就必须声明 Vary，
+        // 否则共享缓存会把 gzip 版本发给不支持压缩的客户端。
+        response->set(http::field::vary, "Accept-Encoding");
     }
 
     // 服务端 & 日期头
     response->set(http::field::server, "BoostBeastHttpServer/2.0");
     auto now = std::chrono::system_clock::now();
     auto now_c = std::chrono::system_clock::to_time_t(now);
+    std::tm tm_buf = gmTimeSafe(now_c);
     std::stringstream date_ss;
-    date_ss << std::put_time(gmtime(&now_c), "%a, %d %b %Y %H:%M:%S GMT");
+    date_ss << std::put_time(&tm_buf, "%a, %d %b %Y %H:%M:%S GMT");
     response->set(http::field::date, date_ss.str());
 
     // Content-Length & payload
@@ -454,14 +619,16 @@ void HttpServer2::buildAndSendResponse(tcp::socket& socket,
 
     // 异步发送
     http::async_write(socket, *response,
-        [response, keep_alive, on_complete](beast::error_code ec, std::size_t) {
+        [response, on_complete](beast::error_code ec, std::size_t) {
             if (ec && ec != boost::asio::error::eof &&
                 ec != boost::asio::error::broken_pipe &&
                 ec != boost::asio::error::connection_reset) {
                 LOG_ERROR("Write error: " + ec.message());
             }
-            // Keep-Alive: 通知调用方继续读取下一个请求
-            if (keep_alive && on_complete && !ec) {
+            // 无论是否 keep-alive 都必须回调：调用方在此递减活跃连接计数。
+            // 旧实现只在 keep-alive 且无错误时回调，导致所有 Connection: close
+            // 请求的计数只增不减（优雅关闭永远等满 30 秒）。
+            if (on_complete) {
                 on_complete();
             }
         }
@@ -490,33 +657,44 @@ void HttpServer2::buildAndSendResponse(std::shared_ptr<ssl::stream<tcp::socket>>
     
     auto response = std::make_shared<http::response<http::string_body>>();
 
-    int status_code = 500;
-    try { status_code = std::atoi(custom_response.status_code.c_str()); } catch (...) {}
-    response->result(http::status(status_code));
+    const int status_int = parseStatusCode(custom_response.status_code);
+    response->result(http::status(status_int));
 
     response->body() = custom_response.body;
 
     for (const auto& [key, value] : custom_response.headers) {
         response->set(key, value);
     }
+    for (const auto& cookie : custom_response.set_cookies) {
+        response->insert(http::field::set_cookie, cookie);
+    }
 
     if (custom_response.headers.find("Content-Type") == custom_response.headers.end()) {
         response->set(http::field::content_type, "text/plain");
     }
 
-    if (should_compress && !response->body().empty()) {
+    const bool already_encoded =
+        custom_response.headers.find("Content-Encoding") != custom_response.headers.end();
+    const std::string content_type =
+        custom_response.headers.count("Content-Type") ? custom_response.headers.at("Content-Type") : "text/plain";
+
+    if (should_compress && !already_encoded && isCompressibleContentType(content_type) &&
+        status_int != 206 && status_int != 304 &&
+        !response->body().empty()) {
         std::string compressed = gzipCompress(response->body());
         if (compressed.size() < response->body().size()) {
             response->body() = std::move(compressed);
             response->set(http::field::content_encoding, "gzip");
         }
+        response->set(http::field::vary, "Accept-Encoding");
     }
 
     response->set(http::field::server, "BoostBeastHttpServer/2.0");
     auto now = std::chrono::system_clock::now();
     auto now_c = std::chrono::system_clock::to_time_t(now);
+    std::tm tm_buf = gmTimeSafe(now_c);
     std::stringstream date_ss;
-    date_ss << std::put_time(gmtime(&now_c), "%a, %d %b %Y %H:%M:%S GMT");
+    date_ss << std::put_time(&tm_buf, "%a, %d %b %Y %H:%M:%S GMT");
     response->set(http::field::date, date_ss.str());
 
     response->prepare_payload();
@@ -570,9 +748,7 @@ void HttpServer2::sendFileResponse(tcp::socket& socket,
     );
     
     // 状态码
-    int status_code = 500;
-    try { status_code = std::atoi(custom_response.status_code.c_str()); } catch (...) {}
-    response->result(http::status(status_code));
+    response->result(http::status(parseStatusCode(custom_response.status_code)));
     response->version(11);
     
     // 复制响应头
@@ -584,8 +760,9 @@ void HttpServer2::sendFileResponse(tcp::socket& socket,
     response->set(http::field::server, "BoostBeastHttpServer/2.0");
     auto now = std::chrono::system_clock::now();
     auto now_c = std::chrono::system_clock::to_time_t(now);
+    std::tm tm_buf = gmTimeSafe(now_c);
     std::stringstream date_ss;
-    date_ss << std::put_time(gmtime(&now_c), "%a, %d %b %Y %H:%M:%S GMT");
+    date_ss << std::put_time(&tm_buf, "%a, %d %b %Y %H:%M:%S GMT");
     response->set(http::field::date, date_ss.str());
     
     // Content-Length (file_body 不自动设置)
@@ -623,9 +800,7 @@ void HttpServer2::sendFileResponse(std::shared_ptr<ssl::stream<tcp::socket>> ssl
         std::make_tuple()
     );
     
-    int status_code = 500;
-    try { status_code = std::atoi(custom_response.status_code.c_str()); } catch (...) {}
-    response->result(http::status(status_code));
+    response->result(http::status(parseStatusCode(custom_response.status_code)));
     response->version(11);
     
     for (const auto& [key, value] : custom_response.headers) {
@@ -635,8 +810,9 @@ void HttpServer2::sendFileResponse(std::shared_ptr<ssl::stream<tcp::socket>> ssl
     response->set(http::field::server, "BoostBeastHttpServer/2.0");
     auto now = std::chrono::system_clock::now();
     auto now_c = std::chrono::system_clock::to_time_t(now);
+    std::tm tm_buf = gmTimeSafe(now_c);
     std::stringstream date_ss;
-    date_ss << std::put_time(gmtime(&now_c), "%a, %d %b %Y %H:%M:%S GMT");
+    date_ss << std::put_time(&tm_buf, "%a, %d %b %Y %H:%M:%S GMT");
     response->set(http::field::date, date_ss.str());
     
     response->content_length(file_size);
@@ -899,11 +1075,15 @@ std::string HttpServer2::urlDecode(const std::string& encoded) {
             if (i + 2 < encoded.length()) {
                 unsigned int byte_val;
                 auto result = std::from_chars(encoded.data() + i + 1, encoded.data() + i + 3, byte_val, 16);
-                if (result.ec == std::errc{}) {
+                if (result.ec == std::errc{} && result.ptr == encoded.data() + i + 3) {
                     decoded += static_cast<char>(byte_val);
                     i += 2;
+                    continue;
                 }
             }
+            // 非法转义（如 "%zz"、结尾孤立的 "%"）保留原字符，
+            // 旧实现会把这个 '%' 直接吞掉，导致 key 被悄悄改写。
+            decoded += '%';
         } else if (encoded[i] == '+') {
             decoded += ' ';
         } else {
@@ -991,12 +1171,18 @@ RegexRouteMatcher::RegexRouteMatcher(const std::string& pattern) : pattern_(patt
             size_t close_brace = regex_pattern.find('}', open_brace + 1);
             if (close_brace == std::string::npos) break;
             
-            // 提取参数名，但RegexRouteMatcher类中没有param_names_成员变量
-            // 我们直接替换为捕获组，不保存参数名
-            
-            // 替换为捕获组 ([^/]+)
-            regex_pattern.replace(open_brace, close_brace - open_brace + 1, "([^/]+)");
-            start_pos = open_brace + 8; // "([^/]+)" 的长度
+            const std::string inner = regex_pattern.substr(open_brace + 1, close_brace - open_brace - 1);
+            const bool is_identifier = !inner.empty() &&
+                std::all_of(inner.begin(), inner.end(), [](unsigned char c) {
+                    return std::isalnum(c) != 0 || c == '_';
+                });
+            // {id} → 匹配任意一段；{[0-9]+} → 把花括号里的内容当正则片段
+            // （README 里写的 /api/users/{[0-9]+} 正是后者，旧实现一律换成
+            //  ([^/]+)，导致"正则路由"其实匹配任意段）
+            const std::string replacement = is_identifier ? std::string("([^/]+)")
+                                                          : std::string("(") + inner + ")";
+            regex_pattern.replace(open_brace, close_brace - open_brace + 1, replacement);
+            start_pos = open_brace + replacement.size(); // 旧实现硬编码 +8，替换串变长会漏字符
         }
         
         // 编译正则表达式 - 检查是否已经有^和$修饰符
@@ -1042,22 +1228,33 @@ bool RegexRouteMatcher::match(const std::string& path, std::unordered_map<std::s
         }
         return false;
     } catch (const std::exception& e) {
+        // 注意：不要在这里现构造 boost::regex —— 异常路径上会变成"每请求编译一次正则"。
+        // regex_ 才是唯一可信的匹配器；匹配过程出错按不匹配处理（fail-closed）。
         LOG_ERROR("Regex matching error: " + std::string(e.what()));
-        // 即使出错，也尝试使用boost::regex_match进行简单匹配
-        try {
-            return boost::regex_match(path, boost::regex(pattern_));
-        } catch (...) {
-            // 最后才回退到字符串比较
-            return path == pattern_;
-        }
+        return false;
     }
 }
 
 // 创建适合的路由匹配器
 std::shared_ptr<RouteMatcher> HttpServer2::createRouteMatcher(const std::string& path) {
-    // 首先检查是否包含路径参数 - 优先使用参数匹配器
+    // 含 {..}：花括号内是标识符 → 参数路由；花括号内是正则片段 → 正则路由
+    // （支持 README 中 /api/users/{[0-9]+} 的写法）
     if (path.find('{') != std::string::npos && path.find('}') != std::string::npos) {
-        return std::make_shared<ParametricRouteMatcher>(path);
+        const size_t open = path.find('{');
+        const size_t close = path.find('}', open);
+        if (close != std::string::npos) {
+            const std::string inner = path.substr(open + 1, close - open - 1);
+            const bool is_identifier = !inner.empty() &&
+                std::all_of(inner.begin(), inner.end(), [](unsigned char c) {
+                    return std::isalnum(c) != 0 || c == '_';
+                });
+            if (is_identifier) {
+                LOG_DEBUG("Creating ParametricRouteMatcher for pattern: '" + path + "'");
+                return std::make_shared<ParametricRouteMatcher>(path);
+            }
+        }
+        LOG_DEBUG("Creating RegexRouteMatcher for brace-regex pattern: '" + path + "'");
+        return std::make_shared<RegexRouteMatcher>(path);
     }
     
     // 检查是否是纯正则表达式模式（包含正则特殊字符）
@@ -1125,6 +1322,9 @@ HttpServer2::~HttpServer2() {
 // 启动服务器
 void HttpServer2::start(int port, size_t thread_pool_size) {
     try {
+        // 允许 stop() 后重新 start()
+        stopped_.store(false);
+        
         // 确定线程池大小，如果为0则使用CPU核心数
         if (thread_pool_size == 0) {
             thread_pool_size = std::thread::hardware_concurrency();
@@ -1195,8 +1395,9 @@ void HttpServer2::start(int port, size_t thread_pool_size) {
         
     } catch (const std::exception& e) {
         LOG_ERROR("Server startup error: " + std::string(e.what()));
-        running_ = false;  // 设置原子变量为false
-                    stop();  // 确保资源被正确释放
+        // 不要先把 running_ 置 false 再 stop()：那样 stop() 会因"未运行"提前返回，
+        // 已经创建的工作线程不会 join，析构时 std::terminate。
+        stop();
         throw;
     }
 }
@@ -1298,35 +1499,47 @@ void HttpServer2::handleClient(StreamType stream, bool use_ssl) {
     
     auto& lowest_layer = getLowestLayer(stream);
     
+    // remote_endpoint() 在连接已断开时会抛异常；而异常从 async 完成回调里逃出
+    // io_context::run() 会直接终结该 worker 线程（容量永久减少）。统一用 error_code 版本。
+    boost::system::error_code ep_ec;
+    const auto remote_ep = lowest_layer.remote_endpoint(ep_ec);
+    if (ep_ec) {
+        LOG_DEBUG("Connection closed before request handling: " + ep_ec.message());
+        active_connections_--;
+        return;
+    }
+    const std::string client_ip = remote_ep.address().to_string();
+
     // 创建调试信息对象
     std::shared_ptr<DebugInfo> debug_info;
     if (debug_mode_) {
         debug_info = std::make_shared<DebugInfo>();
         debug_info->start_time = std::chrono::steady_clock::now();
-        debug_info->client_ip = lowest_layer.remote_endpoint().address().to_string();
-        debug_info->client_port = lowest_layer.remote_endpoint().port();
+        debug_info->client_ip = client_ip;
+        debug_info->client_port = remote_ep.port();
     }
     
     PerformanceMonitor::recordRequest();
     
-    // 检查限流
-    std::string client_ip = lowest_layer.remote_endpoint().address().to_string();
-    if (requests_per_second_ > 0) {
-        if (isRateLimited() || !rate_limiter_.isAllowed(client_ip)) {
-            try {
-                http::response<http::string_body> response;
-                response.version(11);
-                response.result(http::status::too_many_requests);
-                response.set(http::field::content_type, "text/plain");
-                response.set(http::field::retry_after, "60");
-                response.body() = "Too many requests, please try again later.";
-                response.prepare_payload();
-                http::write(stream, response);
-                lowest_layer.shutdown(tcp::socket::shutdown_send);
-            } catch (...) {}
-            active_connections_--;
-            return;
-        }
+    // 检查限流 — 全局 RPS 与 IP 级窗口限流互相独立，任一超限即拒绝。
+    // 旧实现只在 requests_per_second_ > 0 时才检查 rate_limiter_，
+    // 导致"只配置 per-IP 限流"完全不生效。
+    const bool global_limited = (requests_per_second_.load() > 0) && isRateLimited();
+    const bool ip_limited = ip_rate_limit_enabled_.load() && !rate_limiter_.isAllowed(client_ip);
+    if (global_limited || ip_limited) {
+        try {
+            http::response<http::string_body> response;
+            response.version(11);
+            response.result(http::status::too_many_requests);
+            response.set(http::field::content_type, "text/plain");
+            response.set(http::field::retry_after, "60");
+            response.body() = "Too many requests, please try again later.";
+            response.prepare_payload();
+            http::write(stream, response);
+            lowest_layer.shutdown(tcp::socket::shutdown_send);
+        } catch (...) {}
+        active_connections_--;
+        return;
     }
     
     // 创建 shared_ptr 管理流生命周期
@@ -1395,6 +1608,9 @@ void HttpServer2::handleClient(StreamType stream, bool use_ssl) {
             
             try {
                 const auto& beast_request = parser->get();
+                // 统一的计时起点：性能指标与访问日志都基于它，
+                // 不再依赖 debug_mode_（旧实现非 debug 下响应时间恒为 0）。
+                const auto request_start = std::chrono::steady_clock::now();
                 
                 // 请求大小检查
                 if (beast_request.body().size() > max_request_size_) {
@@ -1433,6 +1649,24 @@ void HttpServer2::handleClient(StreamType stream, bool use_ssl) {
                     std::chrono::steady_clock::now().time_since_epoch()).count();
                 std::stringstream rid_ss; rid_ss << std::hex << now_us << "-" << std::hex << seq;
                 custom_request.request_id = rid_ss.str();
+
+                // 记录 TCP 对端地址：handler 里取不到 socket，审计/限流需要来源 IP。
+                // 用 lowest_layer() 统一处理 HTTP 与 HTTPS（ssl_stream 也能拿到底层 socket）。
+                {
+                    boost::system::error_code peer_ec;
+                    const auto endpoint = stream_ptr->lowest_layer().remote_endpoint(peer_ec);
+                    if (!peer_ec) {
+                        custom_request.remote_ip = endpoint.address().to_string();
+                    }
+                }
+
+                // 反向代理流式转发 / WebSocket 代理需要直接写回客户端 socket。
+                // 旧实现从未给该字段赋值 —— 于是 can_stream 恒 false（代理永远走缓冲）
+                // 且 WS 代理恒返回 400。这里在明文 HTTP 下把 socket 交给请求对象。
+                // （TLS 下不暴露底层 socket：代理需要走缓冲路径。）
+                if constexpr (std::is_same_v<StreamType, tcp::socket>) {
+                    custom_request.client_socket = stream_ptr;
+                }
                 
                 // WebSocket 升级检测（仅对非 SSL 连接编译）
                 if constexpr (std::is_same_v<StreamType, tcp::socket>) {
@@ -1453,17 +1687,16 @@ void HttpServer2::handleClient(StreamType stream, bool use_ssl) {
                                 auto ws_stream = std::make_shared<beast_ws::stream<tcp::socket>>(std::move(*stream_ptr));
                                 try {
                                     ws_stream->accept(beast_request);
-                                    std::random_device rd;
-                                    std::mt19937_64 gen(rd());
-                                    std::stringstream ss;
-                                    ss << std::hex << gen();
-                                    std::string ws_id = ss.str();
-                                    std::string client_ip = ll.remote_endpoint().address().to_string();
+                                    // 会话 ID 用 CSPRNG：MT19937 输出可预测，且会话 ID 可被枚举
+                                    std::string ws_id = secureRandomHex(16);
                                     auto ws_session = std::make_shared<http2::ws::WebSocketSession>(
                                                                             ws_stream, ws_id, custom_request.headers, query_params,
                                                                             client_ip, *ws_it->second);
                                     http2::ws::g_ws_manager.add(ws_session);
                                     ws_session->start();
+                                    // 连接已移交给 WebSocket 会话管理，不再计入 HTTP 活跃连接。
+                                    // 旧实现此处直接 return，计数器只增不减。
+                                    active_connections_--;
                                     return;
                                 } catch (const std::exception& e) {
                                     LOG_ERROR("WebSocket upgrade failed: " + std::string(e.what()));
@@ -1496,22 +1729,37 @@ void HttpServer2::handleClient(StreamType stream, bool use_ssl) {
                 }
                 
                 // 路由查找
-                std::unordered_map<std::string, std::string> path_params;
-                auto host_it = custom_request.headers.find("Host");
-                if (host_it != custom_request.headers.end()) path_params["host"] = host_it->second;
-                
+                // Host 头单独传给 findRoute 做虚拟主机匹配，不混进 path_params
+                // （旧实现把 Host 塞进参数表，静态文件子路径处理器按"第一个参数"
+                //   取相对路径时会取到 Host 值）。
+                const std::string host_header =
+                    custom_request.headers.count("Host") ? custom_request.headers.at("Host") : "";
+
                 auto route_start = std::chrono::steady_clock::now();
-                auto route_handler = findRoute(custom_request.method, custom_request.path, path_params);
-                for (const auto& [k, v] : path_params) custom_request.path_params[k] = v;
+                std::unordered_map<std::string, std::string> path_params;
+                auto route_handler = findRoute(custom_request.method, host_header,
+                                               custom_request.path, path_params);
+                custom_request.path_params = std::move(path_params);
                 
                 // 处理请求（中间件链 + 路由处理器）
+                // 中间件返回 nullopt = 放行；返回响应 = 已处理。
+                // 旧实现「响应是 404 就再调一次 handler」会让 handler 执行两次，
+                // 且第二次完全绕过中间件链（鉴权可被跳过）。
                 HttpResponse custom_response;
                 if (route_handler) {
                     custom_response = handleMiddlewareChain(custom_request, global_middlewares_, 0, route_handler->handler);
-                    if (custom_response.status_code == "404")
-                        custom_response = route_handler->handler(custom_request);
                 } else {
                     custom_response = defaultHandler(custom_request);
+                }
+                
+                // 合并中间件挂起的响应头 / Cookie（用户处理器已显式设置的优先）
+                for (const auto& [k, v] : custom_request.pending_response_headers) {
+                    if (custom_response.headers.find(k) == custom_response.headers.end()) {
+                        custom_response.headers[k] = v;
+                    }
+                }
+                for (const auto& cookie : custom_request.pending_response_cookies) {
+                    custom_response.addCookie(cookie);
                 }
                 
                 if (debug_info) {
@@ -1519,11 +1767,13 @@ void HttpServer2::handleClient(StreamType stream, bool use_ssl) {
                         std::chrono::steady_clock::now() - route_start);
                 }
                 
-                // 性能记录
-                int response_time = debug_info ? std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::steady_clock::now() - debug_info->start_time).count() : 0;
-                PerformanceMonitor::recordResponse(custom_request.path, response_time, 
-                    custom_response.body.size(), std::atoi(custom_response.status_code.c_str()) < 400);
+                // 性能记录（与 debug 模式解耦）
+                const int response_time = static_cast<int>(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - request_start).count());
+                PerformanceMonitor::recordResponse(custom_request.path, response_time,
+                    custom_response.body.size(), parseStatusCode(custom_response.status_code) < 400);
+                PerformanceMonitor::recordBytesReceived(beast_request.body().size());
                 
                 // 调试头
                 if (debug_mode_ && debug_info) {
@@ -1534,15 +1784,13 @@ void HttpServer2::handleClient(StreamType stream, bool use_ssl) {
                     custom_response.headers["X-Debug-Route-Time"] = std::to_string(debug_info->routing_time.count()) + "ms";
                 }
                 
-                // 访问日志
-                if (debug_info) {
-                    auto dur = std::chrono::duration_cast<std::chrono::milliseconds>(
-                        std::chrono::steady_clock::now() - debug_info->start_time);
-                    logAccess(debug_info->client_ip, custom_request.path, custom_request.method,
-                             custom_response.status_code,
-                             custom_request.headers.count("User-Agent") ? custom_request.headers["User-Agent"] : ":", 
-                             dur.count(), custom_request.request_id);
-                }
+                // 访问日志：无论是否 debug 都记录（README 承诺的访问日志不应只在调试模式产出）。
+                // 同时修正了原来的参数顺序错误（method / path 之前是反的）。
+                logAccess(custom_request.remote_ip.empty() ? client_ip : custom_request.remote_ip,
+                          custom_request.method, custom_request.path,
+                          custom_response.status_code,
+                          custom_request.headers.count("User-Agent") ? custom_request.headers.at("User-Agent") : "-",
+                          response_time, custom_request.request_id);
                 
                 // 最终处理（CSRF cookie + 安全头 + 调试头 + CORS）
                 finalizeResponse(custom_response, custom_request, use_ssl, debug_info);
@@ -1564,17 +1812,21 @@ void HttpServer2::handleClient(StreamType stream, bool use_ssl) {
                         custom_request.path, false, should_compress,
                         [this]() { active_connections_--; });
                 } else {
-                    auto on_complete = keep_alive ? std::function<void()>([this, stream_ptr]() {
+                    // 统一回调：先递减活跃连接数；keep-alive 且连接仍可用时继续读下一个请求。
+                    // 不再区分 keep_alive 用两个 lambda —— 旧实现里非 keep-alive 分支
+                    // 的 lambda 从来不会被调用，计数只增不减。
+                    auto on_complete = std::function<void()>([this, stream_ptr, keep_alive]() {
                         active_connections_--;
-                        if (stream_ptr && stream_ptr->is_open() && !shutdown_in_progress_) {
+                        if (keep_alive && stream_ptr && stream_ptr->is_open() && !shutdown_in_progress_) {
                             try {
                                 handleClient(std::move(*stream_ptr), false);
                             } catch (const std::exception& e) {
                                 LOG_ERROR("Keep-Alive restart error: " + std::string(e.what()));
-                                active_connections_--;
+                                // 注意：这里不能再减一次（外层已减），
+                                // 重复递减会让 size_t 下溢成天文数字。
                             }
                         }
-                    }) : std::function<void()>([this]() { active_connections_--; });
+                    });
                     
                     buildAndSendResponse(*stream_ptr, custom_response,
                         debug_info ? debug_info->client_ip : "unknown",
@@ -1677,9 +1929,14 @@ std::shared_ptr<net::io_context> HttpServer2::getNextIoContext() {
     return io_context;
 }
 
-// 检查是否超出速率限制
+// 检查是否超出全局限流（1 秒滑动窗口）
 bool HttpServer2::isRateLimited() {
-    if (requests_per_second_ == 0) return false;  // 不限流
+    const size_t limit = requests_per_second_.load();
+    if (limit == 0) return false;  // 不限流
+    
+    // rate_limit_window_ 是普通 time_point，会被多个 io 线程并发读写，
+    // 必须加锁（旧实现存在数据竞争，可能反复重置窗口）。
+    std::lock_guard<std::mutex> lock(rate_limit_mutex_);
     
     auto now = std::chrono::steady_clock::now();
     auto window = std::chrono::seconds(1);
@@ -1687,13 +1944,13 @@ bool HttpServer2::isRateLimited() {
     // 如果过了一秒钟，重置计数器
     if (now - rate_limit_window_ > window) {
         rate_limit_window_ = now;
-        request_count_.store(0);
+        request_count_.store(1);
         return false;
     }
     
     // 增加请求计数并检查是否超过限制
     size_t count = request_count_.fetch_add(1) + 1;
-    return count > requests_per_second_;
+    return count > limit;
 }
 
 // 处理请求队列
@@ -1758,14 +2015,10 @@ void HttpServer2::processRequestQueue() {
                     
                     try {
                         // 直接使用item.request中的path_params，避免重复处理
-                        // 设置虚拟主机匹配参数
-                        auto host_it = item.request->headers.find("Host");
-                        if (host_it != item.request->headers.end()) {
-                            item.request->path_params["host"] = host_it->second;
-                        }
-                        auto route_handler = findRoute(item.request->method, item.request->path, item.request->path_params);
-                        // 清理 host 参数避免干扰路由匹配
-                        item.request->path_params.erase("host");
+                        const std::string host = item.request->headers.count("Host")
+                            ? item.request->headers.at("Host") : "";
+                        auto route_handler = findRoute(item.request->method, host,
+                                                       item.request->path, item.request->path_params);
                         
                         if (route_handler) {
                             // 使用中间件链处理请求
@@ -1782,6 +2035,22 @@ void HttpServer2::processRequestQueue() {
                     
                     // 结束计时并记录性能指标
                     END_TIMER();
+
+                    // 合并中间件挂起的响应头 / Cookie。
+                    // 与 handleClient 主路径保持一致：Session / CSRF / 缓存标记
+                    // / X-Request-ID 这些中间件都通过 pending_* 通道下发，
+                    // 漏掉这一步会让它们在这条路径上凭空消失。
+                    if (item.request) {
+                        for (const auto& [k, v] : item.request->pending_response_headers) {
+                            if (response.headers.find(k) == response.headers.end()) {
+                                response.headers[k] = v;
+                            }
+                        }
+                        for (const auto& cookie : item.request->pending_response_cookies) {
+                            response.addCookie(cookie);
+                        }
+                    }
+
                     if (item.callback) {
                         try {
                             // 减少调试日志，提高性能
@@ -1848,20 +2117,27 @@ void HttpServer2::setConnectionPoolSettings(size_t max_connections, std::chrono:
              ", max_idle_time=" + std::to_string(max_idle_time.count()) + "s");
 }
 
-// 设置速率限制
-void HttpServer2::setRateLimit(size_t requests_per_second, size_t max_queue_size) {
-    requests_per_second_ = requests_per_second;
+// 设置全局 QPS 限流（0 表示不限）
+void HttpServer2::setGlobalRateLimit(size_t requests_per_second, size_t max_queue_size) {
+    requests_per_second_.store(requests_per_second);
     max_queue_size_ = max_queue_size;
-    LOG_INFO("Rate limit settings updated: " + (requests_per_second == 0 ? "unlimited" : std::to_string(requests_per_second) + " req/s") + 
+    LOG_INFO("Global rate limit settings updated: " + (requests_per_second == 0 ? "unlimited" : std::to_string(requests_per_second) + " req/s") + 
              ", max_queue_size=" + std::to_string(max_queue_size));
 }
 
 // 停止服务器
 void HttpServer2::stop() {
     std::lock_guard<std::mutex> lock(stop_mutex_);
-    if (!running_) return;
     
-    running_ = false;  // 设置原子变量为false，所有线程都能立即看到
+    // 幂等：已经完整回收过就直接返回
+    if (stopped_.exchange(true)) {
+        return;
+    }
+    
+    // 注意：这里不能因为 running_==false 就提前返回。
+    // start() 失败时线程可能已经创建，提前返回会留下 joinable 的 std::thread，
+    // 导致 HttpServer2 析构时 std::terminate。
+    running_ = false;
     shutdown_in_progress_ = true;
     std::cout << "HTTP Server stopping..." << std::endl;
     
@@ -2181,8 +2457,10 @@ HttpRequest HttpServer2::convertFromBeastRequest(const http::request<http::strin
         request.path = target;
     }
     
-    // 设置HTTP版本
-    request.version = "HTTP/" + std::to_string(req.version()) + "." + std::to_string(req.keep_alive() ? 1 : 0);
+    // 设置HTTP版本（req.version() 已经是 11 / 10，不能再拼一次 ".1"，
+    // 旧实现会得到 "HTTP/11.1"）
+    request.version = "HTTP/" + std::to_string(req.version() / 10) + "." +
+                      std::to_string(req.version() % 10);
     
     // 设置请求体
     request.body = req.body();
@@ -2212,8 +2490,11 @@ HttpRequest HttpServer2::convertFromBeastRequest(const http::request<http::strin
         // 解析application/json
         else if (content_type.find("application/json") != std::string::npos) {
             LOG_DEBUG("[convertFromBeastRequest] Parsing application/json");
-            // 简单的JSON解析，结果存储在form_data中供方便访问
-            parseJsonBody(request.body, request.form_data);
+            // 结果必须写进 json_body：Validator 读的是 json_body，
+            // 旧实现只写 form_data，导致所有 JSON 字段校验都被静默跳过。
+            parseJsonBody(request.body, request.json_body);
+            // 同时保留写进 form_data 的旧行为，避免已按 form_data 取值的处理器失效
+            request.form_data.insert(request.json_body.begin(), request.json_body.end());
         }
     }
     
@@ -2222,32 +2503,30 @@ HttpRequest HttpServer2::convertFromBeastRequest(const http::request<http::strin
 }
 
 // 查找匹配的路由
-std::optional<Route> HttpServer2::findRoute(const std::string& method, const std::string& path, std::unordered_map<std::string, std::string>& params) {
-    // 先快速路径：检查是否有精确匹配的路由（大多数请求场景）
-    if (!routes_.empty()) {
-        // 使用共享锁而非独占锁，允许并发读取
-        std::shared_lock<std::shared_mutex> lock(routes_mutex_);
+// host 由调用方单独传入（虚拟主机匹配），不再混进 params。
+std::optional<Route> HttpServer2::findRoute(const std::string& method, const std::string& host,
+                                            const std::string& path,
+                                            std::unordered_map<std::string, std::string>& params) {
+    // 读锁覆盖整个查找过程（旧实现在加锁前先读了一次 routes_.empty()，属于数据竞争）
+    std::shared_lock<std::shared_mutex> lock(routes_mutex_);
+    
+    for (const auto& route : routes_) {
+        // 首先检查HTTP方法是否匹配
+        if (route.method != "*" && route.method != method) {
+            continue;
+        }
         
-        // 优先查找完全匹配的路由，避免不必要的正则计算
-        for (const auto& route : routes_) {
-            // 首先检查HTTP方法是否匹配
-            if (route.method != "*" && route.method != method) {
-                continue;
-            }
-            
-            // 如果有 Host 限制，检查是否匹配（在请求处理时已从 request headers 提取）
-            // 此处 host_match 由调用者从 request.headers["Host"] 获取并传入 params["host"]
-            if (!route.host.empty()) {
-                auto host_it = params.find("host");
-                if (host_it == params.end() || host_it->second != route.host) {
-                    continue;
-                }
-            }
-            
-            // 直接使用params作为参数容器，避免额外的映射创建和复制
-            if (route.matcher->match(path, params)) {
-                return route;
-            }
+        // 虚拟主机限制
+        if (!route.host.empty() && host != route.host) {
+            continue;
+        }
+        
+        // 用临时容器接收参数：匹配失败的路由不会污染最终 path_params
+        // （旧的复用同一个 params 会让失败匹配残留部分参数）
+        std::unordered_map<std::string, std::string> matched;
+        if (route.matcher->match(path, matched)) {
+            params.insert(matched.begin(), matched.end());
+            return route;
         }
     }
     
@@ -2257,59 +2536,44 @@ std::optional<Route> HttpServer2::findRoute(const std::string& method, const std
 
 
 
-// 处理中间件链 - 使用迭代而非递归，减少栈开销
-HttpResponse HttpServer2::handleMiddlewareChain(const HttpRequest& request, const std::vector<Middleware>& middlewares, size_t index, const RouteHandler& final_handler) {
-    // 预先分配响应对象，避免多次创建
-    HttpResponse response;
-    bool handled = false;
-    
-    // 使用迭代方式处理中间件链，避免递归调用
+// 处理中间件链
+// 契约：中间件返回 std::nullopt → 放行；返回 HttpResponse → 已处理，中断链。
+HttpResponse HttpServer2::handleMiddlewareChain(HttpRequest& request, const std::vector<Middleware>& middlewares, size_t index, const RouteHandler& final_handler) {
     for (size_t i = index; i < middlewares.size(); ++i) {
+        if (!middlewares[i]) continue;
         try {
-            response = middlewares[i](request);
-            // 检查是否需要继续处理
-            if (response.status_code != "404") {
-                handled = true;
-                break;
+            if (auto handled = middlewares[i](request)) {
+                return *handled;
             }
         } catch (const std::exception& e) {
-            // 记录中间件异常但继续处理
+            // fail-closed：中间件抛异常时绝不能当作"放行"，
+            // 否则一个抛异常的鉴权中间件就等于后门。
             LOG_ERROR("Middleware exception at index " + std::to_string(i) + ": " + std::string(e.what()));
-            continue;
+            PerformanceMonitor::recordError();
+            return createErrorResponse(HttpErrorType::INTERNAL_ERROR, "Middleware error");
         } catch (...) {
-            // 忽略中间件中的非标准异常，继续下一个中间件
             LOG_ERROR("Unknown middleware exception at index " + std::to_string(i));
-            continue;
+            PerformanceMonitor::recordError();
+            return createErrorResponse(HttpErrorType::INTERNAL_ERROR, "Middleware error");
         }
     }
     
-    // 如果没有中间件处理，调用最终处理器
-    if (!handled && final_handler) {
-        try {
-            response = final_handler(request);
-        } catch (const std::exception& e) {
-            // 记录详细的异常信息
-            std::string error_msg = "Exception in route handler for " + request.method + " " + request.path + ": " + std::string(e.what());
-            LOG_ERROR(error_msg);
-            PerformanceMonitor::recordError();
-            
-            // 使用createErrorResponse生成统一格式的错误响应
-            response = createErrorResponse(HttpErrorType::INTERNAL_ERROR, "Internal Server Error");
-        } catch (...) {
-            // 记录未知异常
-            std::string error_msg = "Unknown exception in route handler for " + request.method + " " + request.path;
-            LOG_ERROR(error_msg);
-            PerformanceMonitor::recordError();
-            
-            // 使用createErrorResponse生成统一格式的错误响应
-            response = createErrorResponse(HttpErrorType::INTERNAL_ERROR, "Internal Server Error");
-        }
-    } else if (!handled) {
-        // 如果最终处理器无效，返回默认404响应
-        response = defaultHandler(request);
+    // 所有中间件都放行，执行最终路由处理器
+    if (!final_handler) {
+        return defaultHandler(request);
     }
     
-    return response;
+    try {
+        return final_handler(request);
+    } catch (const std::exception& e) {
+        LOG_ERROR("Exception in route handler for " + request.method + " " + request.path + ": " + std::string(e.what()));
+        PerformanceMonitor::recordError();
+        return createErrorResponse(HttpErrorType::INTERNAL_ERROR, "Internal Server Error");
+    } catch (...) {
+        LOG_ERROR("Unknown exception in route handler for " + request.method + " " + request.path);
+        PerformanceMonitor::recordError();
+        return createErrorResponse(HttpErrorType::INTERNAL_ERROR, "Internal Server Error");
+    }
 }
 
 // 默认处理函数（处理未匹配到的路由）
@@ -2586,13 +2850,13 @@ HttpResponse HttpServer2::serveStaticFile(const HttpRequest& request, const std:
         
         // 获取规范化路径并检查安全性
         try {
-            // 规范化文件路径和基础目录路径，确保两者都使用相同的规范化格式
-            std::filesystem::path canonical_path = std::filesystem::canonical(file_path);
-            std::string canonical_path_str = canonical_path.string();
-            
-            // 确保基础目录也进行规范化处理，以正确处理包含./的路径
-            std::filesystem::path canonical_base_dir = std::filesystem::canonical(base_dir);
-            std::string canonical_base_dir_str = canonical_base_dir.string();
+            // 用 generic_string()：它在所有平台都用 '/' 作为分隔符。
+            // 旧实现手工给 base 末尾补 '/'，而 Windows 的 string() 用反斜杠，
+            // 前缀比较永远不成立 —— Windows 上所有静态文件都会被判 403。
+            std::string canonical_base_dir_str =
+                std::filesystem::canonical(base_dir).generic_string();
+            const std::string canonical_path_str =
+                std::filesystem::canonical(file_path).generic_string();
             
             LOG_DEBUG("serveStaticFile - Canonical path: " + canonical_path_str);
             LOG_DEBUG("serveStaticFile - Canonical base directory: " + canonical_base_dir_str);
@@ -2603,8 +2867,8 @@ HttpResponse HttpServer2::serveStaticFile(const HttpRequest& request, const std:
             }
             
             // 检查文件是否在允许的目录内
-            if (!(canonical_path_str.compare(0, canonical_base_dir_str.length(), canonical_base_dir_str) == 0)) {
-                LOG_DEBUG("serveStaticFile - Security violation: File outside allowed directory");
+            if (canonical_path_str.compare(0, canonical_base_dir_str.length(), canonical_base_dir_str) != 0) {
+                LOG_WARNING("serveStaticFile - Security violation: file outside allowed directory");
                 response.status_code = "403";
                 response.status_message = "Forbidden";
                 response.headers["Content-Type"] = "text/plain";
@@ -2613,8 +2877,14 @@ HttpResponse HttpServer2::serveStaticFile(const HttpRequest& request, const std:
             }
             LOG_DEBUG("[serveStaticFile] Security check passed");
         } catch (const std::exception& e) {
-            LOG_WARNING("serveStaticFile - Error getting canonical path: " + std::string(e.what()));
-            // 继续，让下面的文件存在性检查处理
+            // fail-closed：无法确认路径归属时必须拒绝。
+            // 旧实现只是打日志然后继续，等于把包含性检查静默跳过。
+            LOG_ERROR("serveStaticFile - canonical path check failed: " + std::string(e.what()));
+            response.status_code = "403";
+            response.status_message = "Forbidden";
+            response.headers["Content-Type"] = "text/plain";
+            response.body = "Access denied: unable to verify path";
+            return response;
         }
         
         // 检查文件是否存在
@@ -2655,8 +2925,9 @@ HttpResponse HttpServer2::serveStaticFile(const HttpRequest& request, const std:
         auto tp = std::chrono::time_point_cast<std::chrono::system_clock::duration>(
             last_write_time - std::filesystem::file_time_type::clock::now() + std::chrono::system_clock::now());
         std::time_t last_modified_c = std::chrono::system_clock::to_time_t(tp);
+        std::tm last_modified_tm = gmTimeSafe(last_modified_c);
         std::stringstream last_modified_ss;
-        last_modified_ss << std::put_time(gmtime(&last_modified_c), "%a, %d %b %Y %H:%M:%S GMT");
+        last_modified_ss << std::put_time(&last_modified_tm, "%a, %d %b %Y %H:%M:%S GMT");
         last_modified_str = last_modified_ss.str();
         
         // 检查缓存验证
@@ -2697,24 +2968,59 @@ HttpResponse HttpServer2::serveStaticFile(const HttpRequest& request, const std:
             bool has_range = false;
             
             auto range_it = request.headers.find("Range");
-            if (range_it != request.headers.end()) {
+            if (range_it != request.headers.end() && file_size > 0) {
                 const std::string& range_hdr = range_it->second;
+                bool invalid_range = false;
                 // 仅支持 bytes=start-end 格式
-                if (range_hdr.size() > 6 && range_hdr.substr(0, 6) == "bytes=") {
+                if (range_hdr.size() > 6 && range_hdr.compare(0, 6, "bytes=") == 0) {
                     std::string range_val = range_hdr.substr(6);
                     size_t dash = range_val.find('-');
                     if (dash != std::string::npos) {
-                        std::string start_str = range_val.substr(0, dash);
-                        std::string end_str = range_val.substr(dash + 1);
-                        if (!start_str.empty()) range_start = std::stoull(start_str);
-                        if (!end_str.empty()) range_end = std::stoull(end_str);
-                        if (end_str.empty()) range_end = file_size - 1;
-                        if (range_end >= file_size) range_end = file_size - 1;
-                        if (range_start <= range_end && range_start < file_size) {
-                            has_range = true;
+                        const std::string start_str = range_val.substr(0, dash);
+                        const std::string end_str = range_val.substr(dash + 1);
+                        // 用 from_chars 而不是 stoull：后者遇到 "abc" 会抛异常，
+                        // 让一个畸形 Range 头变成 500。
+                        auto parse_u64 = [](const std::string& s, uint64_t& out) {
+                            if (s.empty()) return false;
+                            auto r = std::from_chars(s.data(), s.data() + s.size(), out);
+                            return r.ec == std::errc{} && r.ptr == s.data() + s.size();
+                        };
+                        bool ok = true;
+                        if (!start_str.empty()) ok = parse_u64(start_str, range_start);
+                        if (ok && !end_str.empty()) ok = parse_u64(end_str, range_end);
+                        if (ok) {
+                            if (end_str.empty() || range_end >= file_size) range_end = file_size - 1;
+                            if (range_start <= range_end && range_start < file_size) {
+                                has_range = true;
+                            } else {
+                                invalid_range = true;
+                            }
+                        } else {
+                            invalid_range = true;
                         }
+                    } else {
+                        invalid_range = true;
                     }
+                } else {
+                    invalid_range = true;
                 }
+                
+                if (invalid_range && !has_range) {
+                    // RFC 7233：无法满足的 Range 返回 416 + Content-Range: bytes */size
+                    response.status_code = "416";
+                    response.status_message = "Range Not Satisfiable";
+                    response.headers["Content-Range"] = "bytes */" + std::to_string(file_size);
+                    response.headers["Content-Type"] = "text/plain";
+                    response.body = "Range Not Satisfiable";
+                    return response;
+                }
+            }
+            
+            // 过大的 Range 退回整文件发送：避免 `bytes=0-9999999999` 触发 GB 级
+            // 一次性内存分配（原实现直接 vector<char>(range_len)）。
+            if (has_range && (range_end - range_start + 1) > (32ull * 1024 * 1024)) {
+                LOG_WARNING("serveStaticFile - Range request too large, fallback to full file");
+                has_range = false;
             }
             
             if (has_range) {
@@ -2811,7 +3117,11 @@ void HttpServer2::serveStatic(const std::string& url_path, const std::string& di
                   relative_path = "";
               }
           } else {
-              relative_path = request.path_params.begin()->second;
+              // RegexRouteMatcher 用捕获组序号作参数名（^/static/(.*)$ → "1"）。
+              // 不能用 begin()：unordered_map 迭代顺序不确定，而且此前 path_params
+              // 里还混入过 Host 头，会把 Host 当成文件名去查磁盘。
+              auto capture = request.path_params.find("1");
+              relative_path = (capture != request.path_params.end()) ? capture->second : std::string();
               LOG_DEBUG("serveStatic - Subpath handler: Using path param: '" + relative_path + "'");
           }
           
@@ -2912,6 +3222,27 @@ bool BackendState::checkHealth() const {
 }
 
 // 反向代理功能实现
+static std::string toLowerAscii(std::string s) {
+    std::transform(s.begin(), s.end(), s.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return s;
+}
+
+// 逐跳（hop-by-hop）头：只对单条连接有意义，代理不得原样转发。
+// 旧实现把上游的 Transfer-Encoding / Connection 直接抄给客户端，
+// 配上被去分块（de-chunked）的 body，会让客户端解析失败。
+static bool isHopByHopHeader(const std::string& name) {
+    static const char* kHopByHop[] = {
+        "connection", "keep-alive", "proxy-authenticate",
+        "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade"
+    };
+    const std::string n = toLowerAscii(name);
+    for (const char* h : kHopByHop) {
+        if (n == h) return true;
+    }
+    return false;
+}
+
 // 为所有HTTP方法添加反向代理
 void HttpServer2::addReverseProxy(const std::string& path, const std::string& target_url) {
     addReverseProxy("*", path, target_url);
@@ -2961,7 +3292,7 @@ void HttpServer2::addReverseProxy(const std::string& method, const std::string& 
     auto counter = std::make_shared<std::atomic<size_t>>(0);
     
     // 创建反向代理处理器，捕获目标URLs和头信息
-    auto proxy_handler = [backends, request_headers, response_headers, counter](const HttpRequest& request) -> HttpResponse {
+    auto proxy_handler = [this, backends, request_headers, response_headers, counter](const HttpRequest& request) -> HttpResponse {
         try {
             // 收集所有健康的或可重试的后端
             std::vector<size_t> candidate_indices;
@@ -3052,11 +3383,13 @@ void HttpServer2::addReverseProxy(const std::string& method, const std::string& 
                     // 设置主机头
                     proxy_request.set(http::field::host, target_parts.host);
                     
-                    // 复制请求头
+                    // 复制请求头（跳过 Host 与逐跳头；Content-Length 由 prepare_payload 重算）
                     for (const auto& [key, value] : request.headers) {
-                        if (key != "Host" && key != "Connection" && key != "Content-Length") {
-                            proxy_request.set(key, value);
+                        if (toLowerAscii(key) == "host" || isHopByHopHeader(key) ||
+                            toLowerAscii(key) == "content-length") {
+                            continue;
                         }
+                        proxy_request.set(key, value);
                     }
                     
                     // 添加/修改请求头
@@ -3070,11 +3403,19 @@ void HttpServer2::addReverseProxy(const std::string& method, const std::string& 
                     // 准备请求
                     proxy_request.prepare_payload();
                     
+                    // 明确要求上游在响应后关闭连接：
+                    // 否则 HTTP/1.1 默认 keep-alive，流式转发会在读完响应体后
+                    // 继续阻塞在 read_some 上直到 5 秒超时（每个请求都卡）。
+                    proxy_request.keep_alive(false);
+                    
                     // 发送请求
                     http::write(stream, proxy_request);
                     
-                    // 检查是否可流式转发（有客户端 socket + 非 SSL）
-                    bool can_stream = (request.client_socket && request.client_socket->is_open());
+                    // 检查是否可流式转发：必须显式开启（默认关闭）+ 有客户端 socket + 非 SSL。
+                    // 流式路径是同步阻塞写，且依赖对上游响应分帧的正确处理，
+                    // 默认走下方"全量缓冲"路径以保证正确性。
+                    const bool can_stream = proxy_streaming_enabled_.load() &&
+                                            request.client_socket && request.client_socket->is_open();
                     
                     if (can_stream) {
                         // ======== 流式转发路径：逐块转发上游响应到客户端 ========
@@ -3092,7 +3433,18 @@ void HttpServer2::addReverseProxy(const std::string& method, const std::string& 
                         resp_header_ss << "HTTP/1.1 " << status_code_int << " "
                                        << upstream_resp.reason() << "\r\n";
                         for (const auto& f : upstream_resp) {
-                            resp_header_ss << f.name_string() << ": " << f.value() << "\r\n";
+                            const std::string name = std::string(f.name_string());
+                            const std::string lower = toLowerAscii(name);
+                            // 逐跳头不转发；但 Transfer-Encoding / Content-Length 必须保留，
+                            // 因为这里 body 是原始字节透传（含 chunk 帧），
+                            // 去掉会让客户端按错误的边界解析。
+                            if (lower == "connection" || lower == "keep-alive" ||
+                                lower == "upgrade" || lower == "trailer" ||
+                                lower == "te" || lower == "proxy-authenticate" ||
+                                lower == "proxy-authorization") {
+                                continue;
+                            }
+                            resp_header_ss << name << ": " << f.value() << "\r\n";
                         }
                         // 添加自定义响应头
                         for (const auto& [k, v] : response_headers) {
@@ -3106,8 +3458,16 @@ void HttpServer2::addReverseProxy(const std::string& method, const std::string& 
                         
                         // 3. 流式转发 body（每次 64KB 块）
                         std::vector<char> chunk(65536);
-                        beast::flat_buffer body_buf;
                         uint64_t total_bytes = 0;
+                        
+                        // read_header 可能把 body 的首段字节一起读进 header_buf，
+                        // 直接丢弃会造成响应体截断 —— 先把残留字节转发出去。
+                        if (header_buf.size() > 0) {
+                            const char* leftover = static_cast<const char*>(header_buf.data().data());
+                            boost::asio::write(*request.client_socket,
+                                boost::asio::buffer(leftover, header_buf.size()));
+                            total_bytes += header_buf.size();
+                        }
                         
                         while (true) {
                             boost::system::error_code read_ec;
@@ -3163,9 +3523,19 @@ void HttpServer2::addReverseProxy(const std::string& method, const std::string& 
                     response.status_code = std::to_string(static_cast<int>(proxy_response.result()));
                     response.status_message = proxy_response.reason();
                     
-                    // 复制响应头
+                    // 复制响应头：跳过逐跳头与 Content-Length（交给 prepare_payload 重算），
+                    // Set-Cookie 用多值容器保存，避免 map 覆盖后只下发一条。
                     for (const auto& field : proxy_response) {
-                        response.headers[std::string(field.name_string())] = std::string(field.value());
+                        const std::string name = std::string(field.name_string());
+                        const std::string lower = toLowerAscii(name);
+                        if (isHopByHopHeader(lower) || lower == "content-length") {
+                            continue;
+                        }
+                        if (lower == "set-cookie") {
+                            response.addCookie(std::string(field.value()));
+                            continue;
+                        }
+                        response.headers[name] = std::string(field.value());
                     }
                     
                     // 添加/修改响应头
@@ -3222,6 +3592,19 @@ void HttpServer2::addReverseProxy(const std::string& method, const std::string& 
     LOG_DEBUG("addReverseProxy - Added reverse proxy route for " + method + " " + path);
 }
 
+
+// ============================================================
+// 反向代理流式转发开关
+// ============================================================
+void HttpServer2::setProxyStreaming(bool enable) {
+    proxy_streaming_enabled_.store(enable);
+    if (enable) {
+        LOG_WARNING("Reverse proxy streaming enabled: responses are written to the client "
+                    "synchronously inside the io_context thread");
+    } else {
+        LOG_INFO("Reverse proxy streaming disabled (buffered mode)");
+    }
+}
 
 // ============================================================
 // WebSocket 代理：将 WebSocket 连接双向转发到目标服务器
@@ -3345,14 +3728,21 @@ std::string HttpServer2::getPrometheusMetrics() const {
     return PerformanceMonitor::generatePrometheusMetrics();
 }
 
-// 设置速率限制
+// 设置 IP 级窗口限流（每 window_size 秒内允许 requests_per_window 次）
 void HttpServer2::setRateLimit(uint32_t requests_per_window, uint32_t window_size_seconds) {
+    if (window_size_seconds == 0) {
+        LOG_WARNING("setRateLimit: window_size_seconds must be > 0, ignored");
+        return;
+    }
+    
     rate_limiter_.setRateLimit(requests_per_window, window_size_seconds);
+    ip_rate_limit_enabled_.store(requests_per_window > 0);
     
-    // 同时更新全局速率限制
-    requests_per_second_ = requests_per_window / window_size_seconds;
-    
-    LOG_INFO("Global rate limit set to " + std::to_string(requests_per_second_) + " requests per second");
+    // 不再顺带推导全局 RPS：旧实现用 requests_per_window / window_size_seconds
+    // 做整除，100 次/60 秒会被算成 1 次/秒（比配置严 100 倍）。
+    // 需要全局限流请显式调用 setGlobalRateLimit()。
+    LOG_INFO("IP rate limit set to " + std::to_string(requests_per_window) + " requests per " +
+             std::to_string(window_size_seconds) + "s");
 }
 
 // 自适应线程池配置
@@ -3434,7 +3824,12 @@ void HttpServer2::startThreadAdjustment() {
     
     thread_adjust_thread_ = std::thread([this]() {
         while (running_) {
-            std::this_thread::sleep_for(thread_adjust_interval_);
+            // 分片睡眠：直接 sleep(interval) 会让 stop() 的 join 最多干等一整个 interval
+            auto waited = std::chrono::milliseconds(0);
+            while (running_ && waited < thread_adjust_interval_) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                waited += std::chrono::milliseconds(200);
+            }
             if (running_) {
                 adjustThreadPoolSize();
             }
@@ -3478,7 +3873,12 @@ void HttpServer2::startConfigWatch() {
     
     config_watch_thread_ = std::thread([this]() {
         while (running_) {
-            std::this_thread::sleep_for(config_check_interval_);
+            // 分片睡眠，避免 stop() 被 config_check_interval_（默认 30s）拖住
+            auto waited = std::chrono::milliseconds(0);
+            while (running_ && waited < config_check_interval_) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                waited += std::chrono::milliseconds(200);
+            }
             if (running_) {
                 watchConfigFile();
             }
@@ -3601,20 +4001,57 @@ void HttpServer2::setBasicAuth(const std::string& realm) {
     LOG_INFO("Basic authentication enabled for realm: " + realm);
 }
 
-void HttpServer2::addUser(const std::string& username, const std::string& password) {
-    // 生成随机盐值（16字节，32个十六进制字符）
-    std::random_device rd;
-    std::mt19937 gen(rd());
-    std::uniform_int_distribution<> distrib(0, 255);
-    std::stringstream salt_ss;
-    for (int i = 0; i < 16; ++i) {
-        salt_ss << std::hex << std::setw(2) << std::setfill('0') << distrib(gen);
+// PBKDF2-HMAC-SHA256 派生口令哈希（输出十六进制）
+// 单轮 SHA-256(salt+password) 的离线爆破成本极低，不适合存口令。
+static std::string pbkdf2Hex(const std::string& password, const std::string& salt_hex,
+                             int iterations, int out_len = 32) {
+    // salt 以十六进制字符串保存，这里还原成字节
+    auto hexval = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+    };
+    std::string salt;
+    salt.reserve(salt_hex.size() / 2);
+    for (size_t i = 0; i + 1 < salt_hex.size(); i += 2) {
+        int hi = hexval(salt_hex[i]);
+        int lo = hexval(salt_hex[i + 1]);
+        if (hi < 0 || lo < 0) return "";
+        salt += static_cast<char>((hi << 4) | lo);
     }
-    std::string salt = salt_ss.str();
     
-    // 计算加盐密码的SHA-256哈希值：SHA256(salt + password)
-    std::string password_hash = calculateSha256(salt + password);
-    basic_auth_users_[username] = {salt, password_hash};
+    std::vector<unsigned char> out(static_cast<size_t>(out_len));
+    if (PKCS5_PBKDF2_HMAC(password.data(), static_cast<int>(password.size()),
+                          reinterpret_cast<const unsigned char*>(salt.data()),
+                          static_cast<int>(salt.size()), iterations, EVP_sha256(),
+                          out_len, out.data()) != 1) {
+        return "";
+    }
+    
+    static const char* hex = "0123456789abcdef";
+    std::string res;
+    res.reserve(out.size() * 2);
+    for (unsigned char c : out) {
+        res += hex[c >> 4];
+        res += hex[c & 0x0f];
+    }
+    return res;
+}
+
+void HttpServer2::addUser(const std::string& username, const std::string& password) {
+    // 128 位随机盐
+    const std::string salt = secureRandomHex(16);
+    const int iterations = 100000;
+    const std::string password_hash = pbkdf2Hex(password, salt, iterations, 32);
+    if (password_hash.empty()) {
+        LOG_ERROR("addUser: PBKDF2 failed for user " + username);
+        return;
+    }
+    
+    // salt 字段里编码迭代次数，方便以后调参而不影响已存在的用户
+    std::lock_guard<std::mutex> lock(basic_auth_mutex_);
+    basic_auth_users_[username] = {std::to_string(iterations) + "$" + salt, password_hash};
     LOG_INFO("User added: " + username);
 }
 
@@ -3638,16 +4075,36 @@ bool HttpServer2::validateBasicAuth(const std::string& auth_header) {
         std::string username = decoded.substr(0, colon_pos);
         std::string password = decoded.substr(colon_pos + 1);
         
-        // 检查用户是否存在
-        auto it = basic_auth_users_.find(username);
-        if (it == basic_auth_users_.end()) {
-            return false;
+        // 在锁内只做查表并拷贝，PBKDF2 计算放到锁外，
+        // 否则多请求会在这把锁上串行化（每次 10 万轮迭代）。
+        std::string stored_salt;
+        std::string stored_hash;
+        {
+            std::lock_guard<std::mutex> lock(basic_auth_mutex_);
+            auto it = basic_auth_users_.find(username);
+            if (it == basic_auth_users_.end()) {
+                return false;
+            }
+            stored_salt = it->second.first;
+            stored_hash = it->second.second;
         }
         
-        // 验证密码：使用存储的盐值重新计算 SHA256(salt + password)
-        const auto& [stored_salt, stored_hash] = it->second;
-        std::string password_hash = calculateSha256(stored_salt + password);
-        return password_hash == stored_hash;
+        // stored_salt 格式："<iterations>$<hexsalt>"；兼容旧格式（纯盐）
+        int iterations = 100000;
+        std::string salt = stored_salt;
+        auto dollar = stored_salt.find('$');
+        if (dollar != std::string::npos) {
+            iterations = std::atoi(stored_salt.substr(0, dollar).c_str());
+            salt = stored_salt.substr(dollar + 1);
+        }
+        if (iterations <= 0) iterations = 100000;
+        
+        const std::string computed = pbkdf2Hex(password, salt, iterations, 32);
+        if (computed.empty() || computed.size() != stored_hash.size()) {
+            return false;
+        }
+        // 恒定时间比较
+        return CRYPTO_memcmp(computed.data(), stored_hash.data(), computed.size()) == 0;
     } catch (...) {
         return false;
     }
@@ -3730,19 +4187,9 @@ void HttpServer2::enableCsrfProtection(bool enable) {
 
 // 生成CSRF令牌
 std::string HttpServer2::generateCsrfToken() {
-    // 生成随机令牌
-    std::string token;
-    const std::string charset = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
-    std::random_device rd;
-    std::mt19937 gen(rd());
-    std::uniform_int_distribution<> distrib(0, charset.size() - 1);
-    
-    token.reserve(32);
-    for (int i = 0; i < 32; ++i) {
-        token += charset[distrib(gen)];
-    }
-    
-    return token;
+    // 128 位 CSPRNG 令牌（32 个十六进制字符）。
+    // 旧实现用 std::mt19937：状态可从少量输出推导，CSRF 令牌不能可预测。
+    return secureRandomHex(16);
 }
 
 // 添加CSRF令牌到响应
@@ -3768,8 +4215,8 @@ void HttpServer2::addCsrfTokenToResponse(HttpResponse& response, const HttpReque
         if (use_ssl_) {
             cookie += "; Secure";
         }
-        response.headers["Set-Cookie"] = cookie;
-        LOG_DEBUG("Added CSRF token to response cookie: " + csrf_token);
+        response.addCookie(cookie);
+        LOG_DEBUG("Added CSRF token to response cookie");
     }
 }
 
@@ -3821,8 +4268,10 @@ bool HttpServer2::validateCsrfToken(const HttpRequest& request) {
         }
     }
     
-    // 验证令牌是否匹配
-    bool isValid = !header_token.empty() && !cookie_token.empty() && header_token == cookie_token;
+    // 验证令牌是否匹配（恒定时间比较，避免逐字节时序猜测）
+    bool isValid = !header_token.empty() && !cookie_token.empty() &&
+                   header_token.size() == cookie_token.size() &&
+                   CRYPTO_memcmp(header_token.data(), cookie_token.data(), header_token.size()) == 0;
     
     if (!isValid) {
         // 只记录token前8字符和后4字符，避免完整token泄露到日志

@@ -243,10 +243,12 @@ static void test_HttpResponseBasics() {
     std::cout << "\n=== 6. HttpResponse ===" << std::endl;
 
     HttpResponse r;
-    TEST("默认状态码空",        r.status_code.empty());
-    TEST("默认状态消息空",       r.status_message.empty());
+    // 2.6 起默认 200/OK：避免处理器忘记赋值时写出 "HTTP/1.1 0" 这种非法状态行
+    TEST("默认状态码 200",       r.status_code == "200");
+    TEST("默认状态消息 OK",      r.status_message == "OK");
     TEST("默认 body 空",        r.body.empty());
     TEST("默认 headers 空",     r.headers.empty());
+    TEST("默认 set_cookies 空", r.set_cookies.empty());
     TEST("默认 file_body_path 空", r.file_body_path.empty());
     TEST("默认 response_sent false", !r.response_sent);
 

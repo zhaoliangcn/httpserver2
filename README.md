@@ -1,8 +1,13 @@
 # HttpServer2
 
-> **版本 2.5** — 高性能 C++17 HTTP 企业级 Web 服务框架
+> **版本 2.6** — 高性能 C++17 HTTP Web 服务框架
 
-基于 Boost.Beast 和 Boost.Asio，提供完整的 HTTP/HTTPS 服务、反向代理、WebSocket、JWT 认证、数据库集成、Session 管理、缓存、插件系统等企业级功能。
+基于 Boost.Beast 和 Boost.Asio，提供完整的 HTTP/HTTPS 服务、反向代理、WebSocket、JWT 认证、数据库集成、Session 管理、缓存、插件系统等功能。
+
+> **2.6 破坏性变更**：中间件契约由「返回 404 表示放行」改为「返回 `std::nullopt` 表示放行，
+> 返回 `HttpResponse` 表示已处理」。原因：旧约定与真实 404 无法区分，且与 JWT / Session /
+> Cache / Validator 四个内置中间件（放行时返回 200）直接冲突 —— 启用后所有请求都会返回空 200。
+> 迁移方式见 `HttpServer2_API文档.md` 第 5 章。
 
 ---
 
@@ -13,7 +18,7 @@
 |------|------|
 | HTTP/1.1 | 完整的请求/响应处理，支持 Keep-Alive 连接复用 |
 | HTTPS | SSL/TLS 加密通信，支持证书配置 |
-| HTTP/2 | 基于 nghttp2 的 HTTP/2 协议支持，ALPN 协商 |
+| HTTP/2 | ⚠️ 实验：`http2/` 模块已实现但**未接入** acceptor（无 ALPN 协商），主链路只跑 HTTP/1.1 |
 | 双后端 | 支持 Boost.Asio 和 hp-async-io 两种后端 |
 | 虚拟主机 | 基于 Host 头的虚拟主机路由 |
 | 请求超时 | 可配置的请求超时控制 |
@@ -28,8 +33,9 @@
 | 方法便捷方法 | `get()` / `post()` / `put()` / `del()` |
 
 ### 中间件链
-- 全局中间件 + 路由级中间件
+- 全局中间件（路由级中间件字段已预留，暂无注册 API）
 - 内置中间件：错误处理、安全头、CORS、CSRF、JWT 认证、Session、请求验证、缓存、请求 ID 追踪
+- 契约：`std::nullopt` = 放行，`HttpResponse` = 已处理；中间件抛异常按 500 处理（失败关闭）
 
 ### 安全机制
 | 特性 | 说明 |
@@ -46,7 +52,9 @@
 - 单后端 / 多后端反向代理
 - 健康检查（自动故障转移）
 - 自定义请求/响应头
+- 逐跳头过滤（Connection / Transfer-Encoding 等不原样透传）
 - WebSocket 代理转发
+- 流式转发默认关闭（`setProxyStreaming(true)` 开启；该路径为同步阻塞写）
 
 ### 静态文件服务
 - ETag / 304 Not Modified 缓存验证
@@ -69,10 +77,10 @@
 
 | 模块 | 说明 |
 |------|------|
-| **缓存层** | 内存缓存，TTL 过期，LRU 淘汰，缓存中间件 |
+| **缓存层** | 内存缓存，TTL 过期，LRU 淘汰；缓存中间件目前只能命中、不能填充（缺 handler 后置钩子） |
 | **流式处理** | 大文件上传流式写入临时文件，分块响应 |
 | **插件系统** | 动态 `.so` 加载，内置插件注册 |
-| **HTTP/2** | nghttp2 集成，多路复用，服务器推送 |
+| **HTTP/2** | ⚠️ 代码已实现但未接入主流程，见「核心 HTTP 引擎」说明 |
 
 ### 可观测性
 
@@ -87,10 +95,11 @@
 
 ### 可配置性
 - YAML 配置文件
-- 配置热重载
-- 自适应线程池
+- ⚠️ 配置热重载：仅检测文件变更并写日志，`reloadConfig()` 为空实现
+- ⚠️ 自适应线程池：只扩容不缩容，且 `pending_requests_` 未被计数，实际不会触发扩容
 - 请求大小限制
-- 连接池管理
+- ⚠️ 连接池：`connection_pool_` 未接入请求流程，`setConnectionPoolSettings()` 仅保存参数
+- 全局限流（`setGlobalRateLimit`）与 per-IP 窗口限流（`setRateLimit`）相互独立
 
 ### 安全配置（环境变量）
 
@@ -355,7 +364,7 @@ server.enableCors(cors);
 ## 测试
 
 ```bash
-# C++ 单元测试（249 用例）
+# C++ 单元测试（226 用例）
 ./test_unit
 
 # Python 集成测试
@@ -376,5 +385,5 @@ cmake --build . --target test-auto
 ---
 
 **许可证**: MIT
-**版本**: 2.5
-**更新日期**: 2026-07-15
+**版本**: 2.6
+**更新日期**: 2026-10-27

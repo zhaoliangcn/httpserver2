@@ -66,7 +66,8 @@ struct UploadedFile {
 
 ```cpp
 // 中间件函数类型
-typedef std::function<HttpResponse(const HttpRequest&)> Middleware;
+// 返回 std::nullopt = 放行；返回 HttpResponse = 已处理并中断链
+typedef std::function<std::optional<HttpResponse>(HttpRequest&)> Middleware;
 
 // 路由处理器函数类型
 typedef std::function<HttpResponse(const HttpRequest&)> RouteHandler;
@@ -245,41 +246,51 @@ server.get("/api/articles/([0-9]+)", [](const HttpRequest& req) {
 
 ## 5. 中间件使用
 
-中间件是一个接收 HttpRequest 并返回 HttpResponse 的函数。中间件可以用于日志记录、认证授权、CORS 支持等。
+中间件在路由处理器之前执行，用于日志、认证、CORS、限流等横切逻辑。
+
+**返回值语义（2.6 起）**：
+
+| 返回值 | 含义 |
+|--------|------|
+| `std::nullopt` | 放行，继续执行下一个中间件；全部放行后执行路由处理器 |
+| `HttpResponse` | 已处理该请求（如 401 / 403 / 400 / 缓存命中），立即中断链并返回 |
+
+> ⚠️ **破坏性变更**：旧版本用「返回 404 表示放行」。该约定与真实 404 响应无法区分，
+> 且与内置中间件（JWT / Session / Cache / Validator 放行时返回 200）直接冲突 ——
+> 只要启用这些中间件，所有请求都会被判定为"已处理"并返回空的 200。
+> 2.6 起改为上表的显式契约，旧式 `[](const HttpRequest&) -> HttpResponse { return 404; }`
+> 必须改写。
+
+中间件参数是 `HttpRequest&`（非 const），因此可以：
+- 把认证结果写回请求头供下游读取，例如 `req.headers["X-JWT-Subject"]`；
+- 通过 `req.pending_response_headers` / `req.pending_response_cookies` 给最终响应追加头或 Cookie
+  （中间件执行时最终响应尚不存在）。
+
+以 `const HttpRequest&` 为参数的 lambda 仍可隐式转换为中间件，只是不能修改请求。
 
 ### 5.1 日志中间件示例
 
 ```cpp
-server.use([](const HttpRequest& request) -> HttpResponse {
+server.use([](const HttpRequest& request) -> std::optional<HttpResponse> {
     std::cout << "[LOG] " << request.method << " " << request.path << std::endl;
-    if (!request.query_params.empty()) {
-        std::cout << "[LOG] Query params:" << std::endl;
-        for (const auto& [key, value] : request.query_params) {
-            std::cout << "  " << key << " = " << value << std::endl;
-        }
-    }
-    // 返回404让后续处理器继续处理
-    HttpResponse response;
-    response.status_code = "404";
-    return response;
+    return std::nullopt;   // 放行
 });
 ```
 
-### 5.2 CORS 中间件示例
+### 5.2 CORS 预检中间件示例
 
 ```cpp
-server.use([](const HttpRequest& request) -> HttpResponse {
-    HttpResponse response;
-    if (request.method == "OPTIONS") {
-        response.status_code = "204";
-        response.status_message = "No Content";
-    } else {
-        response.status_code = "404";
+server.use([](const HttpRequest& request) -> std::optional<HttpResponse> {
+    if (request.method != "OPTIONS") {
+        return std::nullopt;   // 非预检请求：放行
     }
+    HttpResponse response;
+    response.status_code = "204";
+    response.status_message = "No Content";
     response.headers["Access-Control-Allow-Origin"] = "*";
     response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS";
     response.headers["Access-Control-Allow-Headers"] = "Content-Type";
-    return response;
+    return response;   // 有值 = 已处理预检
 });
 ```
 
@@ -418,23 +429,24 @@ server.serveStatic("/static", "./static");
 
 3. **SSL配置**：使用SSL时，请确保证书和密钥文件路径正确且具有适当的访问权限。
 
-4. **中间件执行顺序**：中间件按照添加顺序执行，返回非404响应的中间件会中断后续中间件链。
+4. **中间件执行顺序**：中间件按添加顺序执行；返回 `std::nullopt` 的继续往后走，返回 `HttpResponse` 的立即中断链并直接响应。
 
-5. **路由匹配优先级**：精确路由匹配优先于参数化路由，参数化路由优先于正则表达式路由。
+5. **路由匹配优先级**：按注册顺序（先注册先匹配），同一条链内精确匹配 / 参数匹配 / 正则匹配按 `createRouteMatcher` 的判定走：含 `{标识符}` 走参数匹配，含 `{[正则]}` 或正则元字符走正则匹配。注意 `serveStatic("/")` 会注册 `^/(.*)$` catch-all，应最后注册。
 
-6. **文件路径安全**：静态文件服务实现了路径遍历保护，不允许访问基础目录外的文件。
+6. **文件路径安全**：静态文件服务使用 `canonical()` 做目录包含性校验；校验失败按失败关闭处理（403），不会退化为放行。
 
 ## 9. 错误处理
 
-HttpServer2 提供了默认的404错误处理，但您也可以添加自定义错误处理：
+通道级错误（连接断开、读写超时、请求体超限）由框架直接处理；处理器抛出的异常会被捕获并转为 500，
+中间件抛出的异常同样转为 500（**失败关闭**，不会当作放行）。自定义错误页请写成普通路由或中间件：
 
 ```cpp
-// 添加通用错误处理中间件
-server.use([](const HttpRequest& request) -> HttpResponse {
-    // 这里可以实现自定义的错误处理逻辑
-    // 例如日志记录、友好的错误页面等
+// 自定义 404 页面：注册一个 catch-all 路由（注意放在最后）
+server.get("/{path}", [](const HttpRequest& request) -> HttpResponse {
     HttpResponse response;
-    response.status_code = "404"; // 让其他处理器继续处理
+    response.status_code = "404";
+    response.headers["Content-Type"] = "text/html";
+    response.body = "<h1>Not Found</h1>";
     return response;
 });
 ```

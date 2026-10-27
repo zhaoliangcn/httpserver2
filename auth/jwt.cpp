@@ -1,6 +1,7 @@
 #include "jwt.h"
 #include <openssl/hmac.h>
 #include <openssl/evp.h>
+#include <openssl/crypto.h>
 #include <openssl/bio.h>
 #include <openssl/buffer.h>
 #include <sstream>
@@ -83,6 +84,13 @@ std::string Jwt::hmacSha256(const std::string& data, const std::string& key) {
          result, &result_len);
     
     return std::string(reinterpret_cast<char*>(result), result_len);
+}
+
+// 恒定时间比较：普通 != 会在首个不同字节处提前返回，理论上可被用来
+// 逐字节猜测签名（时序侧信道）。
+static bool constantTimeEquals(const std::string& a, const std::string& b) {
+    if (a.size() != b.size() || a.empty()) return false;
+    return CRYPTO_memcmp(a.data(), b.data(), a.size()) == 0;
 }
 
 // ============================================================
@@ -232,13 +240,22 @@ JwtClaims Jwt::jsonToClaims(const std::string& json) {
 // ============================================================
 std::string Jwt::sign(const JwtClaims& claims, const JwtConfig& config) {
     // 安全检查：HS256 模式下 secret 不能为空
-    if (config.algorithm == "HS256" && config.secret.empty()) {
+    if (config.secret.empty()) {
         LOG_ERROR("JWT sign failed: HS256 secret is empty — set JWT_SECRET environment variable");
         return "";
     }
     
+    // 只实现了 HS256。旧代码在 algorithm != "HS256" 时仍然用 HMAC 签名，
+    // 但把 header 写成 alg=RS256 —— 签出来的 token 与声明算法不符，
+    // 很难排查。这里直接拒绝。
+    const std::string algorithm = config.algorithm.empty() ? "HS256" : config.algorithm;
+    if (algorithm != "HS256") {
+        LOG_ERROR("JWT sign failed: unsupported algorithm '" + algorithm + "' (only HS256 is implemented)");
+        return "";
+    }
+    
     // Header
-    std::string header = "{\"alg\":\"" + config.algorithm + "\",\"typ\":\"JWT\"}";
+    std::string header = "{\"alg\":\"HS256\",\"typ\":\"JWT\"}";
     std::string header_b64 = base64UrlEncode(header);
     
     // Payload
@@ -258,17 +275,8 @@ std::string Jwt::sign(const JwtClaims& claims, const JwtConfig& config) {
     
     // Signature
     std::string signing_input = header_b64 + "." + payload_b64;
-    std::string signature;
-    
-    if (config.algorithm == "HS256") {
-        std::string sig_raw = hmacSha256(signing_input, config.secret);
-        signature = base64UrlEncode(sig_raw);
-    } else {
-        // RS256 — 暂不支持，回退到 HS256
-        LOG_WARNING("RS256 not yet implemented, falling back to HS256");
-        std::string sig_raw = hmacSha256(signing_input, config.secret);
-        signature = base64UrlEncode(sig_raw);
-    }
+    std::string sig_raw = hmacSha256(signing_input, config.secret);
+    std::string signature = base64UrlEncode(sig_raw);
     
     return header_b64 + "." + payload_b64 + "." + signature;
 }
@@ -277,6 +285,14 @@ std::string Jwt::sign(const JwtClaims& claims, const JwtConfig& config) {
 // Token 验证
 // ============================================================
 std::optional<JwtClaims> Jwt::verify(const std::string& token, const JwtConfig& config) {
+    // 关键安全检查：密钥为空时 HMAC 的 key 就是 ""，
+    // 任何人都能在本地算出"合法"签名。sign() 早就有这个检查，verify() 之前没有，
+    // 于是未设置 JWT_SECRET 的部署等于完全没有验签。
+    if (config.secret.empty()) {
+        LOG_ERROR("JWT verify failed: empty secret — refusing to verify (set JWT_SECRET environment variable)");
+        return std::nullopt;
+    }
+    
     // 分割 token
     auto first_dot = token.find('.');
     auto second_dot = token.rfind('.');
@@ -290,12 +306,20 @@ std::optional<JwtClaims> Jwt::verify(const std::string& token, const JwtConfig& 
     std::string payload_b64 = token.substr(first_dot + 1, second_dot - first_dot - 1);
     std::string sig_b64 = token.substr(second_dot + 1);
     
-    // 验证签名
+    // 校验 header 中的 alg：只接受 HS256，避免算法混淆（alg=none / alg=RS256）。
+    std::string header_json = base64UrlDecode(header_b64);
+    std::string alg = extractJsonString(header_json, "alg");
+    if (alg != "HS256") {
+        LOG_WARNING("JWT: unsupported alg '" + alg + "'");
+        return std::nullopt;
+    }
+    
+    // 验证签名（恒定时间比较）
     std::string signing_input = header_b64 + "." + payload_b64;
     std::string expected_sig_raw = hmacSha256(signing_input, config.secret);
     std::string expected_sig_b64 = base64UrlEncode(expected_sig_raw);
     
-    if (sig_b64 != expected_sig_b64) {
+    if (!constantTimeEquals(sig_b64, expected_sig_b64)) {
         LOG_WARNING("JWT: signature mismatch");
         return std::nullopt;
     }
@@ -347,64 +371,52 @@ std::string Jwt::extractFromBearer(const std::string& auth_header) {
 // JWT 认证中间件
 // ============================================================
 Middleware jwtAuthMiddleware(const JwtConfig& config) {
-    return [config](const HttpRequest& req) -> HttpResponse {
-        // 从 Authorization 头提取 token
-        auto auth_it = req.headers.find("Authorization");
-        if (auth_it == req.headers.end()) {
+    return [config](HttpRequest& req) -> std::optional<HttpResponse> {
+        auto unauthorized = [](const std::string& msg) -> std::optional<HttpResponse> {
             HttpResponse resp;
             resp.status_code = "401";
             resp.status_message = "Unauthorized";
             resp.headers["Content-Type"] = "application/json";
-            resp.body = "{\"error\":\"Missing Authorization header\"}";
+            // msg 全部是编译期字面量，不含需要转义的字符
+            resp.body = "{\"error\":\"" + msg + "\"}";
             resp.headers["WWW-Authenticate"] = "Bearer";
             return resp;
+        };
+        
+        // 从 Authorization 头提取 token
+        auto auth_it = req.headers.find("Authorization");
+        if (auth_it == req.headers.end()) {
+            return unauthorized("Missing Authorization header");
         }
         
         std::string token = Jwt::extractFromBearer(auth_it->second);
         if (token.empty()) {
-            HttpResponse resp;
-            resp.status_code = "401";
-            resp.status_message = "Unauthorized";
-            resp.headers["Content-Type"] = "application/json";
-            resp.body = "{\"error\":\"Invalid Authorization header format\"}";
-            resp.headers["WWW-Authenticate"] = "Bearer";
-            return resp;
+            return unauthorized("Invalid Authorization header format");
         }
         
         auto claims = Jwt::verify(token, config);
         if (!claims) {
-            HttpResponse resp;
-            resp.status_code = "401";
-            resp.status_message = "Unauthorized";
-            resp.headers["Content-Type"] = "application/json";
-            resp.body = "{\"error\":\"Invalid or expired token\"}";
-            resp.headers["WWW-Authenticate"] = "Bearer error=\\\"invalid_token\\\"";
-            return resp;
+            return unauthorized("Invalid or expired token");
         }
         
-        // 将 claims 信息传递给下游 — 通过请求头传递
-        // 创建修改后的请求副本（实际用 const ref，这里返回原请求让下游自己读 header）
-        // 通过添加 X-JWT-* 头传递 claims（只能通过可变引用来实现）
-        // 由于 Middleware 返回 HttpResponse，不能修改 HttpRequest
-        // 这里通过 response header 返回 claims，下游 handler 从 response header 读
-        LOG_INFO("JWT auth success: sub=" + claims->subject);
-        
-        // 返回空响应让中间件链继续
-        HttpResponse resp;
-        resp.status_code = "200";
-        resp.status_message = "OK";
-        // 通过自定义头传递 JWT claims 给后续处理器
-        resp.headers["X-JWT-Subject"] = claims->subject;
-        resp.headers["X-JWT-Issuer"] = claims->issuer;
+        // 把 claims 写回请求头，下游 handler 直接读 req.headers["X-JWT-Subject"] 即可。
+        // 中间件签名改为 HttpRequest& 正是为了支持这一点：
+        // 旧实现只能把 claims 塞进响应头，而响应头根本到不了 handler。
+        req.headers["X-JWT-Subject"] = claims->subject;
+        req.headers["X-JWT-Issuer"] = claims->issuer;
         if (!claims->roles.empty()) {
             std::string roles_str;
             for (size_t i = 0; i < claims->roles.size(); ++i) {
                 if (i > 0) roles_str += ",";
                 roles_str += claims->roles[i];
             }
-            resp.headers["X-JWT-Roles"] = roles_str;
+            req.headers["X-JWT-Roles"] = roles_str;
         }
-        return resp;
+        
+        LOG_INFO("JWT auth success: sub=" + claims->subject);
+        
+        // nullopt = 放行到下一个中间件 / 最终 handler
+        return std::nullopt;
     };
 }
 

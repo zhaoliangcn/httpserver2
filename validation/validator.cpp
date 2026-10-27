@@ -288,15 +288,23 @@ ValidationResult Validator::validateForm(const std::unordered_map<std::string, s
 // 验证中间件
 // ============================================================
 Middleware validateMiddleware(const std::vector<Rule>& rules) {
-    return [rules](const HttpRequest& req) -> HttpResponse {
+    return [rules](HttpRequest& req) -> std::optional<HttpResponse> {
         ValidationResult result = Validator::validate(req, rules);
         
         if (!result.valid) {
-            // 构建错误响应
+            // 构建错误响应（错误消息可能含规则里配置的文本，需要转义）
+            auto escape = [](const std::string& s) {
+                std::string out;
+                for (char c : s) {
+                    if (c == '"' || c == '\\') out += '\\';
+                    if (static_cast<unsigned char>(c) >= 0x20) out += c;
+                }
+                return out;
+            };
             std::string body = "{\"error\":\"Validation failed\",\"details\":[";
             for (size_t i = 0; i < result.errors.size(); ++i) {
                 if (i > 0) body += ",";
-                body += "\"" + result.errors[i] + "\"";
+                body += "\"" + escape(result.errors[i]) + "\"";
             }
             body += "]}";
             
@@ -305,14 +313,11 @@ Middleware validateMiddleware(const std::vector<Rule>& rules) {
             resp.status_message = "Bad Request";
             resp.headers["Content-Type"] = "application/json";
             resp.body = body;
-            return resp;
+            return resp;   // 有值 = 已处理（拒绝请求）
         }
         
-        // 验证通过，返回空响应让中间件链继续
-        HttpResponse resp;
-        resp.status_code = "200";
-        resp.status_message = "OK";
-        return resp;
+        // 验证通过：放行到下一个中间件 / 最终 handler
+        return std::nullopt;
     };
 }
 

@@ -8,10 +8,24 @@ namespace http2 { namespace middleware {
 // 请求 ID 中间件
 // ============================================================
 Middleware requestIdMiddleware() {
-    return [](const HttpRequest& req) -> HttpResponse {
-        HttpResponse resp;
-        resp.status_code = "404";  // 继续处理，让后续中间件和路由处理器处理
-        return resp;
+    return [](HttpRequest& req) -> std::optional<HttpResponse> {
+        // 优先沿用客户端传入的 X-Request-ID（便于跨服务串联），否则生成新的。
+        // 旧实现是空转：既不读取也不写入，完全不生成任何 ID。
+        std::string id;
+        auto it = req.headers.find("X-Request-ID");
+        if (it != req.headers.end() && !it->second.empty()) {
+            // 限制长度，避免客户端塞入超长值污染日志
+            id = it->second.substr(0, 128);
+        } else {
+            id = generateRequestId();
+        }
+        
+        req.request_id = id;
+        // 回写请求头（下游 handler 可读）与响应头（发送前由框架合并）
+        req.headers["X-Request-ID"] = id;
+        req.pending_response_headers["X-Request-ID"] = id;
+        
+        return std::nullopt;   // 放行
     };
 }
 
